@@ -1,0 +1,7 @@
+#!/bin/bash
+# Launcher for the Granola Export GUI app bundle.
+# Path-relative: looks for gui.py in the parent folder that contains this .app.
+
+DIR="$(cd "$(dirname "$0")/../../.." && pwd)"
+cd "$DIR"
+exec /usr/bin/env python3 "$DIR/gui.py"
