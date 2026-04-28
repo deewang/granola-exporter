@@ -20,3 +20,9 @@ Icon?
 .idea/
 *.swp
 *~
+
+# PyInstaller / build artefacts
+build/
+dist/
+*.spec
+*.dmg

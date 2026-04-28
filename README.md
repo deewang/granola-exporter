@@ -20,56 +20,32 @@ A tiny macOS desktop app that exports your [Granola](https://www.granola.ai/) me
 
 - **macOS 11+** (uses the Granola desktop app's local cache at `~/Library/Application Support/Granola/`)
 - **Granola desktop app** installed and signed in
-- **Python 3.9+** with **tkinter**
 
-> macOS 12.3+ no longer ships `python3` by default. If `python3 --version` errors out in Terminal, install Python first (see below).
+The pre-built `.app` is fully self-contained — **no Python install required**. (Python and Tkinter are bundled inside the app.) If you'd rather run from source, see [Building from source](#building-from-source).
 
-## Install
+## Install (end users)
 
-### Step 1 — Make sure you have Python 3 + tkinter
+### Step 1 — Download
 
-In Terminal:
-```bash
-python3 --version
-python3 -c "import tkinter; print('tkinter OK')"
-```
+Grab the latest `Granola-Export-X.Y.dmg` from the [Releases page](https://github.com/deewang/granola-exporter/releases).
 
-If either errors, install Python:
+### Step 2 — Install
 
-- **Easiest (recommended):** Download the official installer from [python.org/downloads/macos](https://www.python.org/downloads/macos/). It includes tkinter out of the box.
-- **Homebrew users:** `brew install python python-tk` (you need both — Homebrew's main Python package doesn't bundle tkinter).
-
-### Step 2 — Get the app
-
-**Option A — clone with git:**
-```bash
-git clone https://github.com/deewang/granola-exporter.git ~/Applications/GranolaExport
-```
-
-**Option B — download ZIP** (no git required):
-
-1. Go to https://github.com/deewang/granola-exporter
-2. Click the green **Code** button → **Download ZIP**
-3. Unzip it and move the `granola-exporter-main` folder somewhere convenient (e.g. `~/Applications/GranolaExport`).
+1. Double-click the DMG.
+2. Drag **Granola Export** onto the **Applications** shortcut.
+3. Eject the DMG.
 
 ### Step 3 — First launch (one-time Gatekeeper step)
 
-Because the app isn't code-signed by Apple, macOS will block it the first time you double-click. Two ways around it:
+Because the app isn't yet code-signed by Apple, macOS will block it the first time you launch:
 
-**The easy way** — in Finder, **right-click `Granola Export.app` → Open** → click **Open** in the dialog. macOS remembers your choice; future launches just work.
+> "Apple could not verify 'Granola Export' is free of malware…"
 
-**The terminal way** — run once:
-```bash
-xattr -cr "/path/to/GranolaExport/Granola Export.app"
-```
-
-Then double-click as normal.
-
-> Alternative: skip the `.app` bundle entirely and double-click `Granola Export.command`. It opens a small Terminal window and launches the same GUI — no Gatekeeper prompt.
+In Finder, **right-click `Granola Export` in Applications → Open** → click **Open** in the dialog. macOS remembers your choice; future launches work normally.
 
 ### Step 4 — Add to Dock (optional)
 
-Drag `Granola Export.app` from Finder onto your Dock for one-click access. Spotlight (`Cmd + Space` → "Granola Export") also picks it up.
+Drag `Granola Export` from Applications onto your Dock for one-click access. Spotlight (`Cmd + Space` → "Granola Export") also picks it up.
 
 ## Usage
 
@@ -108,25 +84,70 @@ If the token expires (~6h), open the Granola app once to refresh it, then click 
 
 | Symptom | Fix |
 |---|---|
-| `python3: command not found` when launching | Install Python — see Step 1. |
-| `ModuleNotFoundError: No module named 'tkinter'` | Install tkinter (`brew install python-tk` if on Homebrew). |
-| App won't open: "Apple could not verify…" | Right-click `Granola Export.app` → Open. Or use `Granola Export.command`. |
+| App won't open: "Apple could not verify…" | Right-click `Granola Export.app` → Open (one-time only). |
 | `Auth required` after clicking Refresh | Open the Granola desktop app once (refreshes the token), then click Refresh again. |
 | `cache-v6.json not found` | Make sure the Granola desktop app is installed and you've used it at least once. |
 | Some meetings show `—` for Transcript | Granola only stores transcripts for meetings where recording happened. Old meetings with no recording return 404. |
+
+## Building from source
+
+If you've cloned the repo and want to rebuild the `.app`:
+
+```bash
+# 1. Install Python 3.9+ from https://python.org/downloads/macos/
+# 2. Build the .app
+./build.sh                       # → dist/Granola Export.app  (~30 MB)
+
+# 3. (optional) Package as drag-to-install DMG
+./make-dmg.sh                    # → Granola-Export-1.0.dmg   (~13 MB)
+```
+
+The build uses [PyInstaller](https://pyinstaller.org/) to bundle Python, Tkinter, and all sources into a single `.app`. Output is gitignored.
+
+You can also run from source directly without building:
+```bash
+python3 gui.py        # GUI
+python3 extract.py    # CLI
+```
+
+## Distribution / commercial use
+
+This repo ships an unsigned `.app`. To remove the Gatekeeper warning and ship commercially, you'll need:
+
+1. **Apple Developer Program** ($99/year) — required for code signing and notarization.
+2. **Code sign** the bundle:
+   ```bash
+   codesign --deep --force --options runtime \
+     --sign "Developer ID Application: Your Name (TEAMID)" \
+     "dist/Granola Export.app"
+   ```
+3. **Notarize** with Apple (one-time per build):
+   ```bash
+   xcrun notarytool submit Granola-Export-1.0.dmg \
+     --apple-id you@example.com --team-id TEAMID --password APP_PASSWORD --wait
+   xcrun stapler staple Granola-Export-1.0.dmg
+   ```
+4. **Auto-updates** (optional): integrate [Sparkle](https://sparkle-project.org/).
+5. **Sales / licensing**: [Gumroad](https://gumroad.com), [Paddle](https://paddle.com), or Stripe + a license-key check inside the app.
+
+The current MIT license permits commercial use, but if you're shipping paid you'll likely want to add a EULA and a license-key gate.
 
 ## File layout
 
 ```
 GranolaExport/
-├── Granola Export.app          # macOS app bundle (double-clickable)
-├── Granola Export.command      # alt launcher (opens in Terminal)
+├── Granola Export.app          # source-tree launcher (uses system Python)
+├── Granola Export.command      # alt source-tree launcher
 ├── gui.py                      # Tkinter GUI
 ├── extract.py                  # CLI
 ├── granola_core.py             # shared logic (auth, API, file output)
 ├── migrate_speaker_labels.py   # one-shot script to update old exports
+├── build.sh                    # build self-contained .app via PyInstaller
+├── make-dmg.sh                 # package .app as drag-to-install DMG
 ├── transcripts/                # output (gitignored — your data stays local)
-└── INDEX.md                    # generated index (gitignored)
+├── INDEX.md                    # generated index (gitignored)
+├── dist/                       # PyInstaller output (gitignored)
+└── *.dmg                       # release artefacts (gitignored)
 ```
 
 ## Privacy
