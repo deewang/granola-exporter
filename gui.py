@@ -1225,46 +1225,98 @@ class MeetingDetailWindow(ctk.CTkToplevel):
             messagebox.showerror("Not connected", "Reconnect to Granola first.")
             return
         self.btn_save.configure(state="disabled", text="Fetching…")
-        self._set_status("Fetching transcript from Granola cloud…", TEXT_SECONDARY)
+        self._set_status("Fetching transcript from Granola cloud (this may take a few seconds for long meetings)…", TEXT_SECONDARY)
+        # Animated dot pulse while fetching
+        self._pulse_active = True
+        self._pulse_step = 0
+        self.after(400, self._tick_pulse)
         threading.Thread(target=self._fetch_and_save_worker, daemon=True).start()
 
-    def _fetch_and_save_worker(self):
-        out_dir = Path(self.app.out_root.get()) / "transcripts"
-        out_dir.mkdir(parents=True, exist_ok=True)
+    def _tick_pulse(self):
+        if not getattr(self, "_pulse_active", False):
+            return
+        dots = "." * (1 + (self._pulse_step % 3))
+        self.btn_save.configure(text=f"Fetching{dots}")
+        self._pulse_step += 1
+        self.after(400, self._tick_pulse)
 
-        segments = None
+    def _fetch_and_save_worker(self):
+        """Fetch + save the transcript. Always resets button on exit."""
+        result_status = ("Fetched", ACCENT)
+        result_button_text = "💾  Re-fetch & save"
+        path = None
+        had_transcript = False
+
         try:
-            resp = fetch_transcript(self.doc["id"], self.app.token)
+            out_dir = Path(self.app.out_root.get()) / "transcripts"
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            # 1) Fetch from API
+            segments = None
+            try:
+                resp = fetch_transcript(self.doc["id"], self.app.token)
+            except urllib.error.HTTPError as e:
+                if e.code in (401, 403):
+                    self.app._log("Detail window: auth expired during fetch")
+                    result_status = (f"Auth expired (HTTP {e.code}) — Reconnect", DANGER)
+                else:
+                    result_status = (f"HTTP {e.code} from Granola", DANGER)
+                result_button_text = "⬇  Try again"
+                return
+            except Exception as e:
+                self.app._log(f"Detail window: fetch error: {e}")
+                result_status = (f"Network error: {e}", DANGER)
+                result_button_text = "⬇  Try again"
+                return
+
+            # 2) Normalise response into a segments list
             if resp is None:
-                self.after(0, lambda: self._set_status("No transcript available", TEXT_TERTIARY))
+                segments = None       # 404 — no transcript
             elif isinstance(resp, list):
                 segments = resp
-            elif isinstance(resp, dict) and "transcript" in resp:
-                segments = resp["transcript"]
-        except urllib.error.HTTPError as e:
-            self.after(0, lambda: self._set_status(f"HTTP {e.code} — try Reconnect", DANGER))
-            self.after(0, lambda: self.btn_save.configure(state="normal", text="⬇  Fetch transcript"))
-            return
-        except Exception as e:
-            self.after(0, lambda: self._set_status(f"Error: {e}", DANGER))
-            self.after(0, lambda: self.btn_save.configure(state="normal", text="⬇  Fetch transcript"))
-            return
+            elif isinstance(resp, dict):
+                # Wrapped shapes we've seen / might see
+                for key in ("transcript", "segments", "data"):
+                    if isinstance(resp.get(key), list):
+                        segments = resp[key]
+                        break
+            had_transcript = bool(segments)
 
-        try:
-            path, meta = write_meeting_file(out_dir, self.doc, segments)
-        except Exception as e:
-            self.after(0, lambda: self._set_status(f"Write error: {e}", DANGER))
-            return
+            # 3) Write to disk (always — even if no transcript, we save notes + meta)
+            try:
+                path, _meta = write_meeting_file(out_dir, self.doc, segments)
+            except Exception as e:
+                self.app._log(f"Detail window: write error: {e}")
+                result_status = (f"Write error: {e}", DANGER)
+                result_button_text = "⬇  Try again"
+                return
 
-        # Refresh the window from the freshly-written file
-        self.after(0, lambda p=path: self._set_text(p.read_text()))
-        self.after(0, lambda: self._set_status(f"Saved to {path.name}", ACCENT))
-        self.after(0, lambda: self.btn_save.configure(state="normal", text="💾  Re-fetch & save"))
-        self.after(0, lambda: self.btn_reveal.configure(state="normal"))
-        self.after(0, lambda: self.btn_copy.configure(state="normal"))
+            # 4) Update text widget on the main thread
+            try:
+                content = path.read_text()
+                self.after(0, lambda c=content: self._set_text(c))
+            except Exception as e:
+                self.app._log(f"Detail window: render error: {e}")
 
-        # Tell the parent app this row is now exported
-        self.after(0, lambda: self.app._on_external_export(self.doc["id"]))
+            # 5) Compose final status
+            if had_transcript:
+                result_status = (f"Saved · {len(segments)} segments", ACCENT)
+            elif segments is None:
+                result_status = ("No transcript available — saved notes only", TEXT_TERTIARY)
+            else:
+                result_status = ("Empty transcript — saved notes only", TEXT_TERTIARY)
+
+        finally:
+            # Stop the dot-pulse animation
+            self._pulse_active = False
+            # Always re-enable the button + run dependent UI updates on the main thread
+            self.after(0, lambda s=result_status: self._set_status(*s))
+            self.after(0, lambda t=result_button_text: self.btn_save.configure(state="normal", text=t))
+            if path is not None:
+                self.after(0, lambda: self.btn_reveal.configure(state="normal"))
+                self.after(0, lambda: self.btn_copy.configure(state="normal"))
+                # Notify parent so the row pill flips NEW → EXPORTED
+                self.after(0, lambda: self.app._on_external_export(self.doc["id"]))
 
     def _reveal_in_finder(self):
         path = self._existing_path()
