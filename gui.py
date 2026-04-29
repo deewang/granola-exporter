@@ -886,28 +886,18 @@ class App(ctk.CTk):
         self.people_count_label.pack(side="left", padx=(10, 0), pady=(8, 0))
 
         # ----- search bar -----
-        search_row = ctk.CTkFrame(self._people_list_frame, fg_color="transparent", height=40)
-        search_row.pack(fill="x", padx=24, pady=(0, 8))
-        search_row.pack_propagate(False)
-
-        search_wrap = ctk.CTkFrame(
-            search_row, fg_color=BG_PANEL, corner_radius=8,
-            border_width=1, border_color=BORDER, height=34,
-        )
-        search_wrap.pack(side="left", fill="x", expand=True)
-        ctk.CTkLabel(
-            search_wrap, text="🔍", font=f(13), text_color=TEXT_TERTIARY,
-        ).pack(side="left", padx=(10, 4))
-
+        # Single CTkEntry that fills horizontally — wrapping in another frame
+        # tripped the fill propagation, so the icon lives in the placeholder.
         self.people_search_var = tk.StringVar()
         self.people_search_var.trace_add("write", lambda *_a: self._on_people_search_change())
-        ctk.CTkEntry(
-            search_wrap, textvariable=self.people_search_var,
-            placeholder_text="Search by name, email, or domain…",
-            font=f(13), fg_color=BG_PANEL, border_width=0,
+        search_entry = ctk.CTkEntry(
+            self._people_list_frame, textvariable=self.people_search_var,
+            placeholder_text="🔍   Search by name, email, or domain…",
+            font=f(13), fg_color=BG_PANEL, border_width=1, border_color=BORDER,
             text_color=TEXT_PRIMARY, placeholder_text_color=TEXT_TERTIARY,
-            height=30,
-        ).pack(side="left", fill="x", expand=True, padx=(0, 10))
+            height=34, corner_radius=8,
+        )
+        search_entry.pack(fill="x", padx=24, pady=(0, 8))
 
         # ----- column headers -----
         col_headers = ctk.CTkFrame(self._people_list_frame, fg_color="transparent", height=22)
