@@ -871,52 +871,55 @@ class App(ctk.CTk):
         threading.Thread(target=self._refresh_worker, daemon=True).start()
 
     def _refresh_worker(self):
+        """Always releases worker_busy in finally so the UI can never get stuck."""
         try:
-            token, source, remaining = load_access_token()
-            self.token = token
-            self.token_remaining = remaining
-            self._log(f"Authenticated via {source} (~{remaining // 60}min remaining)")
-            self.after(0, lambda r=remaining: self._set_chip(
-                f"● Connected · {r // 60}m", CHIP_OK_FG, CHIP_OK_BG,
+            try:
+                token, source, remaining = load_access_token()
+                self.token = token
+                self.token_remaining = remaining
+                self._log(f"Authenticated via {source} (~{remaining // 60}min remaining)")
+                self.after(0, lambda r=remaining: self._set_chip(
+                    f"● Connected · {r // 60}m", CHIP_OK_FG, CHIP_OK_BG,
+                ))
+            except AuthError as e:
+                self._log(f"AUTH ERROR: {e}")
+                self.token = None
+                self.after(0, lambda: self._set_chip("● Session expired", CHIP_ERR_FG, CHIP_ERR_BG))
+                self.after(0, lambda: self._set_status("Authentication required — click the badge", DANGER))
+                self.after(0, self._show_reconnect_dialog)
+                return
+
+            try:
+                docs = load_documents()
+            except Exception as e:
+                self._log(f"ERROR loading cache: {e}")
+                return
+
+            out_dir = Path(self.out_root.get()) / "transcripts"
+            existing = scan_existing(out_dir)
+
+            self.docs = docs
+            self.existing = existing
+            self._apply_sort()
+            new_count = sum(1 for d in docs if meeting_filename(d) not in existing)
+
+            self.checked = {d["id"] for d in docs if meeting_filename(d) not in existing}
+            self.current_page = 0
+
+            self.after(0, self._render_current_page)
+            self.after(0, lambda nc=new_count: self.summary_label.configure(
+                text=f"{len(docs)} meetings · {nc} new · {len(docs) - nc} exported"
             ))
-        except AuthError as e:
-            self._log(f"AUTH ERROR: {e}")
-            self.token = None
-            self.after(0, lambda: self._set_chip("● Session expired", CHIP_ERR_FG, CHIP_ERR_BG))
-            self.after(0, lambda: self._set_status("Authentication required — click the badge", DANGER))
-            self.after(0, self._show_reconnect_dialog)
-            self.after(0, lambda: self._set_busy(False))
-            return
-
-        try:
-            docs = load_documents()
+            self.after(0, lambda nc=new_count: self._set_status(
+                f"{nc} new meeting{'s' if nc != 1 else ''} ready to export" if nc else "All caught up",
+                ACCENT if nc else TEXT_PRIMARY,
+            ))
+            self.after(0, self._update_count)
         except Exception as e:
-            self._log(f"ERROR loading cache: {e}")
+            self._log(f"REFRESH WORKER unexpected error: {type(e).__name__}: {e}")
+        finally:
+            # Guarantees the UI is unlocked, even if anything above raised.
             self.after(0, lambda: self._set_busy(False))
-            return
-
-        out_dir = Path(self.out_root.get()) / "transcripts"
-        existing = scan_existing(out_dir)
-
-        self.docs = docs
-        self.existing = existing
-        self._apply_sort()
-        new_count = sum(1 for d in docs if meeting_filename(d) not in existing)
-
-        # auto-tick new ones (across all pages)
-        self.checked = {d["id"] for d in docs if meeting_filename(d) not in existing}
-
-        self.current_page = 0
-        self.after(0, self._render_current_page)
-        self.after(0, lambda nc=new_count: self.summary_label.configure(
-            text=f"{len(docs)} meetings · {nc} new · {len(docs) - nc} exported"
-        ))
-        self.after(0, lambda nc=new_count: self._set_status(
-            f"{nc} new meeting{'s' if nc != 1 else ''} ready to export" if nc else "All caught up",
-            ACCENT if nc else TEXT_PRIMARY,
-        ))
-        self.after(0, self._update_count)
-        self.after(0, lambda: self._set_busy(False))
 
     # ---------- export ----------
 
@@ -940,71 +943,79 @@ class App(ctk.CTk):
         ).start()
 
     def _export_worker(self, docs: list[dict], out_root: Path, out_dir: Path):
+        """Always releases worker_busy in finally so the UI never gets stuck."""
         fetched = no_tx = errors = 0
         entries_by_name = {m.filename: m for m in collect_existing_meta(out_dir)}
         total = len(docs)
 
-        for i, doc in enumerate(docs, 1):
-            title = doc.get("title") or "Untitled"
-            self._log(f"[{i}/{total}] {title}")
-
-            segments = None
-            try:
-                resp = fetch_transcript(doc["id"], self.token)
-                if resp is None:
-                    no_tx += 1
-                elif isinstance(resp, list):
-                    segments = resp
-                    if segments:
-                        fetched += 1
-                elif isinstance(resp, dict) and "transcript" in resp:
-                    segments = resp["transcript"]
-                    if segments:
-                        fetched += 1
-            except urllib.error.HTTPError as e:
-                if e.code in (401, 403):
-                    self._log("AUTH expired mid-run — opening reconnect dialog.")
-                    self.token = None
-                    self.after(0, lambda: self._set_chip(
-                        "● Session expired", CHIP_ERR_FG, CHIP_ERR_BG))
-                    self.after(0, lambda: self._set_status(
-                        "Auth expired mid-export. Reconnect and re-run.", DANGER))
-                    self.after(0, self._show_reconnect_dialog)
-                    self.after(0, lambda: self._set_busy(False))
-                    return
-                errors += 1
-                self._log(f"  HTTP {e.code} for {title}")
-            except Exception as e:
-                errors += 1
-                self._log(f"  ERROR: {e}")
-
-            try:
-                _, meta = write_meeting_file(out_dir, doc, segments)
-                entries_by_name[meta.filename] = meta
-                self.after(0, self._mark_exported, doc["id"])
-            except Exception as e:
-                self._log(f"  WRITE ERROR: {e}")
-
-            self.after(0, lambda v=i, n=total: self.progress.set(v / n))
-            self.after(0, lambda i=i, n=total: self._set_status(f"Exporting {i} / {n}…"))
-            time.sleep(0.15)
-
         try:
-            write_index(out_root, list(entries_by_name.values()))
-            self._log(f"Wrote INDEX.md ({len(entries_by_name)} entries)")
-        except Exception as e:
-            self._log(f"INDEX ERROR: {e}")
+            for i, doc in enumerate(docs, 1):
+                title = doc.get("title") or "Untitled"
+                self._log(f"[{i}/{total}] {title}")
 
-        self._log(f"\n✅ Done — {fetched} transcripts, {no_tx} without, {errors} errors")
-        self.after(0, lambda: self.progress.set(1))
-        self.after(0, lambda: self._set_status(
-            f"Done · {fetched} transcripts · {errors} errors",
-            ACCENT if not errors else TEXT_PRIMARY,
-        ))
-        self.after(0, lambda: self._set_busy(False))
-        self.existing = scan_existing(out_dir)
-        self.checked.clear()
-        self.after(0, self._update_count)
+                segments = None
+                try:
+                    resp = fetch_transcript(doc["id"], self.token)
+                    if resp is None:
+                        no_tx += 1
+                    elif isinstance(resp, list):
+                        segments = resp
+                        if segments:
+                            fetched += 1
+                    elif isinstance(resp, dict):
+                        for key in ("transcript", "segments", "data"):
+                            if isinstance(resp.get(key), list):
+                                segments = resp[key]
+                                if segments:
+                                    fetched += 1
+                                break
+                except urllib.error.HTTPError as e:
+                    if e.code in (401, 403):
+                        self._log("AUTH expired mid-run — opening reconnect dialog.")
+                        self.token = None
+                        self.after(0, lambda: self._set_chip(
+                            "● Session expired", CHIP_ERR_FG, CHIP_ERR_BG))
+                        self.after(0, lambda: self._set_status(
+                            "Auth expired mid-export. Reconnect and re-run.", DANGER))
+                        self.after(0, self._show_reconnect_dialog)
+                        return
+                    errors += 1
+                    self._log(f"  HTTP {e.code} for {title}")
+                except Exception as e:
+                    errors += 1
+                    self._log(f"  ERROR: {e}")
+
+                try:
+                    _, meta = write_meeting_file(out_dir, doc, segments)
+                    entries_by_name[meta.filename] = meta
+                    self.after(0, self._mark_exported, doc["id"])
+                except Exception as e:
+                    self._log(f"  WRITE ERROR: {e}")
+
+                self.after(0, lambda v=i, n=total: self.progress.set(v / n))
+                self.after(0, lambda i=i, n=total: self._set_status(f"Exporting {i} / {n}…"))
+                time.sleep(0.15)
+
+            try:
+                write_index(out_root, list(entries_by_name.values()))
+                self._log(f"Wrote INDEX.md ({len(entries_by_name)} entries)")
+            except Exception as e:
+                self._log(f"INDEX ERROR: {e}")
+
+            self._log(f"\n✅ Done — {fetched} transcripts, {no_tx} without, {errors} errors")
+            self.after(0, lambda: self.progress.set(1))
+            self.after(0, lambda f=fetched, e=errors: self._set_status(
+                f"Done · {f} transcripts · {e} errors",
+                ACCENT if not e else TEXT_PRIMARY,
+            ))
+            self.existing = scan_existing(out_dir)
+            self.checked.clear()
+            self.after(0, self._update_count)
+        except Exception as e:
+            self._log(f"EXPORT WORKER unexpected error: {type(e).__name__}: {e}")
+        finally:
+            # GUARANTEED: always re-enable buttons no matter what
+            self.after(0, lambda: self._set_busy(False))
 
     def _mark_exported(self, doc_id: str):
         w = self.row_widgets.get(doc_id)
@@ -1241,82 +1252,117 @@ class MeetingDetailWindow(ctk.CTkToplevel):
         self.after(400, self._tick_pulse)
 
     def _fetch_and_save_worker(self):
-        """Fetch + save the transcript. Always resets button on exit."""
-        result_status = ("Fetched", ACCENT)
-        result_button_text = "💾  Re-fetch & save"
-        path = None
-        had_transcript = False
+        """Fetch + save the transcript.
+
+        All UI updates are bundled into ONE atomic main-thread call at the end,
+        so we can never end up in a half-updated state.
+        """
+        log = self.app._log
+        title = self.doc.get("title") or "Untitled"
+        log(f"[detail:{title[:30]}] worker started")
+
+        # Final state snapshot — populated as we go, applied once at the end.
+        result = {
+            "status_text": "Done",
+            "status_color": ACCENT,
+            "button_text": "💾  Re-fetch & save",
+            "content": None,         # if set, will replace the text widget
+            "enable_extras": False,  # reveal + copy + parent-row update
+        }
 
         try:
             out_dir = Path(self.app.out_root.get()) / "transcripts"
             out_dir.mkdir(parents=True, exist_ok=True)
 
-            # 1) Fetch from API
-            segments = None
+            # 1) Fetch
             try:
                 resp = fetch_transcript(self.doc["id"], self.app.token)
+                log(f"[detail:{title[:30]}] fetch ok ({type(resp).__name__})")
             except urllib.error.HTTPError as e:
+                log(f"[detail:{title[:30]}] HTTP {e.code}")
                 if e.code in (401, 403):
-                    self.app._log("Detail window: auth expired during fetch")
-                    result_status = (f"Auth expired (HTTP {e.code}) — Reconnect", DANGER)
+                    result["status_text"] = f"Auth expired (HTTP {e.code}) — Reconnect"
                 else:
-                    result_status = (f"HTTP {e.code} from Granola", DANGER)
-                result_button_text = "⬇  Try again"
+                    result["status_text"] = f"HTTP {e.code} from Granola"
+                result["status_color"] = DANGER
+                result["button_text"] = "⬇  Try again"
                 return
             except Exception as e:
-                self.app._log(f"Detail window: fetch error: {e}")
-                result_status = (f"Network error: {e}", DANGER)
-                result_button_text = "⬇  Try again"
+                log(f"[detail:{title[:30]}] fetch error: {e}")
+                result["status_text"] = f"Network error: {e}"
+                result["status_color"] = DANGER
+                result["button_text"] = "⬇  Try again"
                 return
 
-            # 2) Normalise response into a segments list
+            # 2) Normalise response
+            segments = None
             if resp is None:
-                segments = None       # 404 — no transcript
+                segments = None
             elif isinstance(resp, list):
                 segments = resp
             elif isinstance(resp, dict):
-                # Wrapped shapes we've seen / might see
                 for key in ("transcript", "segments", "data"):
                     if isinstance(resp.get(key), list):
                         segments = resp[key]
                         break
-            had_transcript = bool(segments)
+            log(f"[detail:{title[:30]}] segments: {len(segments) if segments else 0}")
 
-            # 3) Write to disk (always — even if no transcript, we save notes + meta)
+            # 3) Write to disk
             try:
                 path, _meta = write_meeting_file(out_dir, self.doc, segments)
+                log(f"[detail:{title[:30]}] wrote {path.name}")
             except Exception as e:
-                self.app._log(f"Detail window: write error: {e}")
-                result_status = (f"Write error: {e}", DANGER)
-                result_button_text = "⬇  Try again"
+                log(f"[detail:{title[:30]}] write error: {e}")
+                result["status_text"] = f"Write error: {e}"
+                result["status_color"] = DANGER
+                result["button_text"] = "⬇  Try again"
                 return
 
-            # 4) Update text widget on the main thread
+            # 4) Read content for the text widget (do this in worker thread, not UI thread)
             try:
-                content = path.read_text()
-                self.after(0, lambda c=content: self._set_text(c))
+                result["content"] = path.read_text()
+                log(f"[detail:{title[:30]}] read {len(result['content'])} chars")
             except Exception as e:
-                self.app._log(f"Detail window: render error: {e}")
+                log(f"[detail:{title[:30]}] read error: {e}")
 
             # 5) Compose final status
-            if had_transcript:
-                result_status = (f"Saved · {len(segments)} segments", ACCENT)
+            if segments:
+                result["status_text"] = f"Saved · {len(segments)} segments"
+                result["status_color"] = ACCENT
             elif segments is None:
-                result_status = ("No transcript available — saved notes only", TEXT_TERTIARY)
+                result["status_text"] = "No transcript available — saved notes only"
+                result["status_color"] = TEXT_TERTIARY
             else:
-                result_status = ("Empty transcript — saved notes only", TEXT_TERTIARY)
+                result["status_text"] = "Empty transcript — saved notes only"
+                result["status_color"] = TEXT_TERTIARY
+            result["enable_extras"] = True
+
+        except Exception as e:
+            # Catch-all to be sure we never hang the UI
+            log(f"[detail:{title[:30]}] unexpected error: {type(e).__name__}: {e}")
+            result["status_text"] = f"Error: {e}"
+            result["status_color"] = DANGER
+            result["button_text"] = "⬇  Try again"
 
         finally:
-            # Stop the dot-pulse animation
             self._pulse_active = False
-            # Always re-enable the button + run dependent UI updates on the main thread
-            self.after(0, lambda s=result_status: self._set_status(*s))
-            self.after(0, lambda t=result_button_text: self.btn_save.configure(state="normal", text=t))
-            if path is not None:
-                self.after(0, lambda: self.btn_reveal.configure(state="normal"))
-                self.after(0, lambda: self.btn_copy.configure(state="normal"))
-                # Notify parent so the row pill flips NEW → EXPORTED
-                self.after(0, lambda: self.app._on_external_export(self.doc["id"]))
+            log(f"[detail:{title[:30]}] applying results: status={result['status_text']!r}")
+            # ONE atomic UI update on the main thread.
+            self.after(0, lambda r=result: self._apply_worker_results(r))
+
+    def _apply_worker_results(self, r: dict):
+        """Apply all worker results in deterministic order on the UI thread."""
+        try:
+            self._set_status(r["status_text"], r["status_color"])
+            self.btn_save.configure(state="normal", text=r["button_text"])
+            if r["enable_extras"]:
+                self.btn_reveal.configure(state="normal")
+                self.btn_copy.configure(state="normal")
+                self.app._on_external_export(self.doc["id"])
+            if r["content"] is not None:
+                self._set_text(r["content"])
+        except Exception as e:
+            self.app._log(f"[detail] apply-results error: {e}")
 
     def _reveal_in_finder(self):
         path = self._existing_path()
