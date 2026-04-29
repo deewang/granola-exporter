@@ -226,11 +226,21 @@ class App(ctk.CTk):
         bar.pack(fill="x", padx=28, pady=(0, 8))
         bar.pack_propagate(False)
 
-        # Left: summary stats
+        # Left: summary stats + info link
         self.summary_label = ctk.CTkLabel(
             bar, text="Loading…", font=f(12), text_color=TEXT_SECONDARY,
         )
         self.summary_label.pack(side="left")
+
+        info_link = ctk.CTkLabel(
+            bar, text="ⓘ Where does this data come from?",
+            font=ctk.CTkFont(family=FONT_FAMILY, size=12, underline=True),
+            text_color=TEXT_SECONDARY, cursor="hand2",
+        )
+        info_link.pack(side="left", padx=(10, 0))
+        info_link.bind("<Button-1>", lambda _e: self._show_data_info())
+        info_link.bind("<Enter>", lambda _e: info_link.configure(text_color=TEXT_PRIMARY))
+        info_link.bind("<Leave>", lambda _e: info_link.configure(text_color=TEXT_SECONDARY))
 
         # Right: selected count
         self.selected_label = ctk.CTkLabel(
@@ -417,9 +427,13 @@ class App(ctk.CTk):
             text_color=TEXT_TERTIARY, anchor="e",
         ).pack(anchor="e", pady=(2, 0))
 
+        # Click on row body (anything except checkbox) opens the detail window.
         for w in (text_col, title_lbl, meta_lbl, right, dot, pill):
-            w.bind("<Button-1>",
-                   lambda _e, did=doc["id"], var=check_var: self._toggle_via_click(did, var))
+            w.bind("<Button-1>", lambda _e, d=doc: self._open_detail(d))
+            try:
+                w.configure(cursor="hand2")
+            except tk.TclError:
+                pass
 
         def on_enter(_e=None, w=row, c=hover): w.configure(fg_color=c)
         def on_leave(_e=None, w=row, c=bg): w.configure(fg_color=c)
@@ -436,6 +450,10 @@ class App(ctk.CTk):
         new_val = not var.get()
         var.set(new_val)
         self._toggle(doc_id, new_val)
+
+    def _open_detail(self, doc: dict):
+        """Open a window showing the meeting's notes + transcript."""
+        MeetingDetailWindow(self, doc)
 
     def _extract_people_short(self, doc: dict) -> str:
         people = doc.get("people") or {}
@@ -644,6 +662,69 @@ class App(ctk.CTk):
             else:
                 self._set_chip(f"● Connected · {mins}m", CHIP_OK_FG, CHIP_OK_BG)
         self.after(5000, self._tick_token_status)
+
+    def _show_data_info(self):
+        """Modal explaining where the meeting list + transcripts come from."""
+        if hasattr(self, "_info_win") and self._info_win.winfo_exists():
+            self._info_win.lift()
+            return
+
+        win = ctk.CTkToplevel(self)
+        self._info_win = win
+        win.title("Where does this data come from?")
+        win.geometry("560x540")
+        win.configure(fg_color=BG_WINDOW)
+        win.resizable(False, False)
+        win.transient(self)
+
+        ctk.CTkLabel(
+            win, text="Where the data comes from",
+            font=f(20, "bold", display=True), text_color=TEXT_PRIMARY,
+        ).pack(anchor="w", padx=22, pady=(20, 10))
+
+        body = ctk.CTkFrame(win, fg_color=BG_PANEL, corner_radius=10,
+                            border_width=1, border_color=BORDER)
+        body.pack(fill="both", expand=True, padx=22, pady=(0, 12))
+
+        sections = [
+            ("Meeting list",
+             "Read locally from the Granola desktop app's cache file:\n"
+             "~/Library/Application Support/Granola/cache-v6.json\n\n"
+             "Granola syncs this file automatically when you open the app."),
+            ("Transcript text",
+             "Fetched from Granola's cloud at export time:\n"
+             "POST https://api.granola.ai/v1/get-document-transcript\n\n"
+             "Granola only stores transcripts in their cloud — they're not on your Mac until you export them here."),
+            ("Authentication",
+             "Read locally from the Granola desktop app's session file:\n"
+             "~/Library/Application Support/Granola/supabase.json\n\n"
+             "If your session expires (~6h), use Reconnect."),
+            ("Limitations",
+             "• You need internet access at export time.\n"
+             "• Meetings without a recording return 404 — only their notes export.\n"
+             "• If Granola deletes a transcript on their end (retention, privacy), it disappears for us too.\n"
+             "• Granola doesn't officially support this endpoint, so it could break in a future update."),
+            ("Privacy",
+             "Your transcripts only travel between Granola's cloud (HTTPS) and this app on your Mac.\n"
+             "Exported Markdown files stay on your computer in the output folder you chose."),
+        ]
+
+        for heading, text in sections:
+            ctk.CTkLabel(
+                body, text=heading, font=f(13, "bold"), text_color=TEXT_PRIMARY,
+                anchor="w",
+            ).pack(anchor="w", padx=18, pady=(14, 2))
+            ctk.CTkLabel(
+                body, text=text, font=f(12), text_color=TEXT_SECONDARY,
+                wraplength=480, justify="left", anchor="w",
+            ).pack(anchor="w", padx=18, pady=(0, 4))
+
+        ctk.CTkButton(
+            win, text="Close", font=f(13, "bold"),
+            fg_color=NEUTRAL_BTN, hover_color=NEUTRAL_BTN_HOVER,
+            text_color=NEUTRAL_BTN_TEXT, corner_radius=8,
+            height=34, width=100, command=win.destroy,
+        ).pack(side="bottom", anchor="e", padx=22, pady=(0, 18))
 
     def _show_reconnect_dialog(self):
         """Modal explaining auth + offering to open Granola + watch for refresh."""
@@ -934,6 +1015,360 @@ class App(ctk.CTk):
         w["is_new"] = False
         w["pill"].configure(text="EXPORTED", text_color=PILL_EXPORTED_FG, fg_color=PILL_EXPORTED_BG)
         w["var"].set(False)
+
+    def _on_external_export(self, doc_id: str):
+        """Called by a detail window after it exported its meeting."""
+        # Update existing-set + row visuals
+        out_dir = Path(self.out_root.get()) / "transcripts"
+        self.existing = scan_existing(out_dir)
+        self._mark_exported(doc_id)
+        # Update summary count
+        new_count = sum(1 for d in self.docs if meeting_filename(d) not in self.existing)
+        self.summary_label.configure(
+            text=f"{len(self.docs)} meetings · {new_count} new · {len(self.docs) - new_count} exported"
+        )
+
+
+# ---------- meeting detail window ----------
+
+class MeetingDetailWindow(ctk.CTkToplevel):
+    SPEAKER_COLOR_ME = "#0F8A47"      # green for "Me"
+    SPEAKER_COLOR_THEM = "#7C3AED"    # violet for "Them"
+
+    def __init__(self, app: "App", doc: dict):
+        super().__init__(app, fg_color=BG_WINDOW)
+        self.app = app
+        self.doc = doc
+        self.title(doc.get("title") or "Untitled meeting")
+        self.geometry("820x720")
+        self.minsize(560, 460)
+
+        self._build_ui()
+        self.after(50, self._load_content)
+
+    # ---------- UI ----------
+
+    def _build_ui(self):
+        # Header
+        header = ctk.CTkFrame(self, fg_color="transparent")
+        header.pack(fill="x", padx=24, pady=(20, 8))
+
+        title_text = self.doc.get("title") or "Untitled meeting"
+        ctk.CTkLabel(
+            header, text=title_text, font=f(22, "bold", display=True),
+            text_color=TEXT_PRIMARY, wraplength=720, justify="left", anchor="w",
+        ).pack(anchor="w")
+
+        # Metadata row
+        meta_parts = []
+        dt = parse_iso(self.doc.get("created_at"))
+        if dt:
+            meta_parts.append(dt.astimezone().strftime("%A, %b %d, %Y · %H:%M"))
+        people = self._people_names()
+        if people:
+            meta_parts.append(", ".join(people))
+        ctk.CTkLabel(
+            header, text="  ·  ".join(meta_parts) or "—",
+            font=f(12), text_color=TEXT_SECONDARY, anchor="w",
+        ).pack(anchor="w", pady=(4, 0))
+
+        # Action bar
+        actions = ctk.CTkFrame(self, fg_color="transparent")
+        actions.pack(fill="x", padx=24, pady=(8, 8))
+
+        self.btn_save = ctk.CTkButton(
+            actions, text="💾  Save as Markdown", font=f(12, "bold"),
+            fg_color=NEUTRAL_BTN, hover_color=NEUTRAL_BTN_HOVER,
+            text_color=NEUTRAL_BTN_TEXT, corner_radius=8,
+            height=30, width=170, command=self._save_to_disk,
+            state="disabled",
+        )
+        self.btn_save.pack(side="left")
+
+        self.btn_reveal = ctk.CTkButton(
+            actions, text="📂  Reveal in Finder", font=f(12),
+            fg_color=GHOST_BTN, hover_color=GHOST_BTN_HOVER,
+            text_color=GHOST_BTN_TEXT,
+            border_color=GHOST_BTN_BORDER, border_width=1,
+            corner_radius=8, height=30, width=160, command=self._reveal_in_finder,
+            state="disabled",
+        )
+        self.btn_reveal.pack(side="left", padx=(8, 0))
+
+        self.btn_copy = ctk.CTkButton(
+            actions, text="📋  Copy", font=f(12),
+            fg_color=GHOST_BTN, hover_color=GHOST_BTN_HOVER,
+            text_color=GHOST_BTN_TEXT,
+            border_color=GHOST_BTN_BORDER, border_width=1,
+            corner_radius=8, height=30, width=80, command=self._copy_to_clipboard,
+            state="disabled",
+        )
+        self.btn_copy.pack(side="left", padx=(8, 0))
+
+        self.status_lbl = ctk.CTkLabel(
+            actions, text="", font=f(12), text_color=TEXT_TERTIARY,
+        )
+        self.status_lbl.pack(side="right")
+
+        # Content area
+        wrap = ctk.CTkFrame(self, fg_color=BG_PANEL, corner_radius=12,
+                            border_width=1, border_color=BORDER)
+        wrap.pack(fill="both", expand=True, padx=24, pady=(4, 20))
+
+        # tk.Text for rich markdown rendering with tags
+        text_frame = tk.Frame(wrap, bg=BG_PANEL, highlightthickness=0)
+        text_frame.pack(fill="both", expand=True, padx=12, pady=12)
+
+        self.text = tk.Text(
+            text_frame,
+            wrap="word", relief="flat", borderwidth=0,
+            bg=BG_PANEL, fg=TEXT_PRIMARY,
+            padx=14, pady=10, spacing3=2,
+            font=(FONT_FAMILY, 13),
+        )
+        scrollbar = tk.Scrollbar(text_frame, command=self.text.yview, width=12,
+                                  bg=BG_PANEL, troughcolor=BG_PANEL,
+                                  highlightthickness=0, relief="flat", bd=0,
+                                  activebackground=TEXT_TERTIARY)
+        self.text.configure(yscrollcommand=scrollbar.set, state="disabled")
+        scrollbar.pack(side="right", fill="y")
+        self.text.pack(side="left", fill="both", expand=True)
+
+        self._configure_text_tags()
+
+    def _configure_text_tags(self):
+        t = self.text
+        t.tag_configure("h1", font=(FONT_FAMILY_DISPLAY, 20, "bold"),
+                        foreground=TEXT_PRIMARY, spacing1=4, spacing3=10)
+        t.tag_configure("h2", font=(FONT_FAMILY, 15, "bold"),
+                        foreground=TEXT_PRIMARY, spacing1=12, spacing3=6)
+        t.tag_configure("h3", font=(FONT_FAMILY, 13, "bold"),
+                        foreground=TEXT_PRIMARY, spacing1=8, spacing3=4)
+        t.tag_configure("body", font=(FONT_FAMILY, 13),
+                        foreground=TEXT_PRIMARY, spacing3=4, lmargin1=0, lmargin2=0)
+        t.tag_configure("muted", font=(FONT_FAMILY, 11),
+                        foreground=TEXT_TERTIARY)
+        t.tag_configure("speaker_me", font=(FONT_FAMILY, 13, "bold"),
+                        foreground=self.SPEAKER_COLOR_ME)
+        t.tag_configure("speaker_them", font=(FONT_FAMILY, 13, "bold"),
+                        foreground=self.SPEAKER_COLOR_THEM)
+        t.tag_configure("speaker_other", font=(FONT_FAMILY, 13, "bold"),
+                        foreground=TEXT_SECONDARY)
+        t.tag_configure("bullet", font=(FONT_FAMILY, 13),
+                        foreground=TEXT_PRIMARY, lmargin1=18, lmargin2=32)
+        t.tag_configure("placeholder", font=(FONT_FAMILY, 14),
+                        foreground=TEXT_TERTIARY, justify="center", spacing1=80)
+
+    # ---------- helpers ----------
+
+    def _people_names(self) -> list[str]:
+        people = self.doc.get("people") or {}
+        names: list[str] = []
+        if isinstance(people, dict):
+            for grp in people.values():
+                if isinstance(grp, list):
+                    for p in grp:
+                        if isinstance(p, dict):
+                            n = p.get("name") or p.get("email")
+                            if n:
+                                names.append(n)
+        return names
+
+    def _existing_path(self) -> Path | None:
+        """Path to the already-exported .md file, if it exists."""
+        out_dir = Path(self.app.out_root.get()) / "transcripts"
+        path = out_dir / meeting_filename(self.doc)
+        return path if path.exists() else None
+
+    def _set_status(self, text: str, color: str = TEXT_TERTIARY):
+        self.status_lbl.configure(text=text, text_color=color)
+
+    def _set_text(self, content: str):
+        self.text.configure(state="normal")
+        self.text.delete("1.0", "end")
+        self._render_markdown(content)
+        self.text.configure(state="disabled")
+
+    # ---------- content loading ----------
+
+    def _load_content(self):
+        existing = self._existing_path()
+        if existing:
+            self._set_status(f"Loaded from {existing.name}", TEXT_SECONDARY)
+            self._set_text(existing.read_text())
+            self.btn_save.configure(state="normal", text="💾  Re-fetch & save")
+            self.btn_reveal.configure(state="normal")
+            self.btn_copy.configure(state="normal")
+        else:
+            # Not exported yet — show placeholder + offer to fetch
+            self._show_placeholder()
+
+    def _show_placeholder(self):
+        if not self.app.token:
+            self._set_text(
+                "_Not exported yet, and no Granola session is active._\n\n"
+                "Click **Reconnect** in the main window's connection chip, then re-open this meeting."
+            )
+            self.btn_save.configure(state="disabled")
+            return
+
+        self.text.configure(state="normal")
+        self.text.delete("1.0", "end")
+        self.text.insert("end", "Transcript not exported yet.\n\nClick \"Save as Markdown\" to fetch it.", "placeholder")
+        self.text.configure(state="disabled")
+        self.btn_save.configure(state="normal", text="⬇  Fetch transcript")
+
+    # ---------- actions ----------
+
+    def _save_to_disk(self):
+        if not self.app.token:
+            messagebox.showerror("Not connected", "Reconnect to Granola first.")
+            return
+        self.btn_save.configure(state="disabled", text="Fetching…")
+        self._set_status("Fetching transcript from Granola cloud…", TEXT_SECONDARY)
+        threading.Thread(target=self._fetch_and_save_worker, daemon=True).start()
+
+    def _fetch_and_save_worker(self):
+        out_dir = Path(self.app.out_root.get()) / "transcripts"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        segments = None
+        try:
+            resp = fetch_transcript(self.doc["id"], self.app.token)
+            if resp is None:
+                self.after(0, lambda: self._set_status("No transcript available", TEXT_TERTIARY))
+            elif isinstance(resp, list):
+                segments = resp
+            elif isinstance(resp, dict) and "transcript" in resp:
+                segments = resp["transcript"]
+        except urllib.error.HTTPError as e:
+            self.after(0, lambda: self._set_status(f"HTTP {e.code} — try Reconnect", DANGER))
+            self.after(0, lambda: self.btn_save.configure(state="normal", text="⬇  Fetch transcript"))
+            return
+        except Exception as e:
+            self.after(0, lambda: self._set_status(f"Error: {e}", DANGER))
+            self.after(0, lambda: self.btn_save.configure(state="normal", text="⬇  Fetch transcript"))
+            return
+
+        try:
+            path, meta = write_meeting_file(out_dir, self.doc, segments)
+        except Exception as e:
+            self.after(0, lambda: self._set_status(f"Write error: {e}", DANGER))
+            return
+
+        # Refresh the window from the freshly-written file
+        self.after(0, lambda p=path: self._set_text(p.read_text()))
+        self.after(0, lambda: self._set_status(f"Saved to {path.name}", ACCENT))
+        self.after(0, lambda: self.btn_save.configure(state="normal", text="💾  Re-fetch & save"))
+        self.after(0, lambda: self.btn_reveal.configure(state="normal"))
+        self.after(0, lambda: self.btn_copy.configure(state="normal"))
+
+        # Tell the parent app this row is now exported
+        self.after(0, lambda: self.app._on_external_export(self.doc["id"]))
+
+    def _reveal_in_finder(self):
+        path = self._existing_path()
+        if not path:
+            return
+        import subprocess
+        subprocess.run(["open", "-R", str(path)])
+
+    def _copy_to_clipboard(self):
+        path = self._existing_path()
+        if not path:
+            return
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(path.read_text())
+            self._set_status("Copied to clipboard", ACCENT)
+            self.after(2000, lambda: self._set_status(""))
+        except Exception as e:
+            self._set_status(f"Copy failed: {e}", DANGER)
+
+    # ---------- markdown rendering ----------
+
+    def _render_markdown(self, raw: str):
+        """Render a subset of markdown into the tk.Text widget with tags.
+
+        Handles: YAML frontmatter (skipped/folded into a muted line),
+        # / ## / ### headings, **Me:** / **Them:** speaker prefixes,
+        - bullets, **bold** spans, blank lines.
+        """
+        t = self.text
+        lines = raw.split("\n")
+        i = 0
+
+        # Strip YAML frontmatter
+        if lines and lines[0].strip() == "---":
+            j = 1
+            while j < len(lines) and lines[j].strip() != "---":
+                j += 1
+            if j < len(lines):
+                # Keep date + participants as a muted header line
+                meta = {}
+                for ln in lines[1:j]:
+                    if ":" in ln:
+                        k, v = ln.split(":", 1)
+                        meta[k.strip()] = v.strip().strip('"')
+                date_disp = meta.get("date", "")
+                if date_disp:
+                    dt = parse_iso(date_disp)
+                    if dt:
+                        date_disp = dt.astimezone().strftime("%A, %b %d, %Y · %H:%M")
+                if date_disp:
+                    t.insert("end", date_disp + "\n", "muted")
+                i = j + 1
+
+        for ln in lines[i:]:
+            if not ln.strip():
+                t.insert("end", "\n")
+                continue
+            if ln.startswith("# "):
+                t.insert("end", ln[2:].rstrip() + "\n", "h1")
+            elif ln.startswith("## "):
+                t.insert("end", ln[3:].rstrip() + "\n", "h2")
+            elif ln.startswith("### "):
+                t.insert("end", ln[4:].rstrip() + "\n", "h3")
+            elif ln.startswith("- ") or ln.startswith("* "):
+                t.insert("end", "•  ", "bullet")
+                self._insert_inline(ln[2:].rstrip() + "\n", "bullet")
+            else:
+                self._insert_speaker_or_body(ln + "\n")
+
+    def _insert_speaker_or_body(self, line: str):
+        """Detect **Me:** / **Them:** at start, render speaker tag + rest."""
+        t = self.text
+        for label, tag in [("**Me:**", "speaker_me"), ("**Them:**", "speaker_them")]:
+            if line.startswith(label + " "):
+                t.insert("end", label.replace("**", "") + " ", tag)
+                self._insert_inline(line[len(label) + 1:], "body")
+                return
+        # Generic **Speaker:** prefix?
+        if line.startswith("**") and "**" in line[2:]:
+            end = line.index("**", 2)
+            speaker = line[2:end]
+            t.insert("end", speaker + " ", "speaker_other")
+            self._insert_inline(line[end + 2:].lstrip(), "body")
+            return
+        self._insert_inline(line, "body")
+
+    def _insert_inline(self, text: str, base_tag: str):
+        """Insert text with **bold** spans honored."""
+        t = self.text
+        i = 0
+        while i < len(text):
+            j = text.find("**", i)
+            if j < 0:
+                t.insert("end", text[i:], base_tag)
+                return
+            if j > i:
+                t.insert("end", text[i:j], base_tag)
+            k = text.find("**", j + 2)
+            if k < 0:
+                t.insert("end", text[j:], base_tag)
+                return
+            t.insert("end", text[j + 2:k], (base_tag, "speaker_other"))
+            i = k + 2
 
 
 if __name__ == "__main__":
