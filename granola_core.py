@@ -14,6 +14,66 @@ from pathlib import Path
 from typing import Optional
 
 
+# ---------- preferences ----------
+
+PREFS_DIR = Path.home() / "Library/Application Support/GranolaExport"
+PREFS_FILE = PREFS_DIR / "preferences.json"
+
+
+@dataclass
+class Preferences:
+    auto_scan_enabled: bool = False
+    auto_scan_interval_minutes: int = 120          # 2 hours
+    notify_on_new: bool = True
+    last_scan_iso: str = ""
+    last_scan_new_count: int = 0
+    last_scan_fetched_count: int = 0
+    output_folder: str = ""                        # empty → use DEFAULT_OUT_ROOT
+
+
+def load_preferences() -> "Preferences":
+    if not PREFS_FILE.exists():
+        return Preferences()
+    try:
+        raw = json.loads(PREFS_FILE.read_text())
+        valid_keys = {f.name for f in Preferences.__dataclass_fields__.values()} \
+            if hasattr(Preferences, "__dataclass_fields__") else set()
+        # __dataclass_fields__ values are Field objects; iterate keys
+        valid_keys = set(Preferences.__dataclass_fields__.keys())
+        return Preferences(**{k: v for k, v in raw.items() if k in valid_keys})
+    except Exception:
+        return Preferences()
+
+
+def save_preferences(prefs: "Preferences") -> None:
+    from dataclasses import asdict
+    PREFS_DIR.mkdir(parents=True, exist_ok=True)
+    PREFS_FILE.write_text(json.dumps(asdict(prefs), indent=2))
+
+
+# ---------- macOS notifications ----------
+
+def notify_macos(title: str, message: str, subtitle: str = "") -> bool:
+    """Send a native macOS notification via osascript. Returns True on success."""
+    import subprocess
+    parts = [
+        "display notification",
+        json.dumps(message),
+        f"with title {json.dumps(title)}",
+    ]
+    if subtitle:
+        parts.append(f"subtitle {json.dumps(subtitle)}")
+    script = " ".join(parts)
+    try:
+        subprocess.run(
+            ["osascript", "-e", script],
+            check=False, capture_output=True, timeout=5,
+        )
+        return True
+    except Exception:
+        return False
+
+
 def _read_version() -> str:
     """Single source of truth for the app version, read from VERSION file.
 

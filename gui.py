@@ -21,14 +21,18 @@ from tkinter import filedialog, messagebox
 from granola_core import (
     AuthError,
     DEFAULT_OUT_ROOT,
+    Preferences,
     SUPABASE_FILE,
     __version__ as APP_VERSION,
     collect_existing_meta,
     fetch_transcript,
     load_access_token,
     load_documents,
+    load_preferences,
     meeting_filename,
+    notify_macos,
     parse_iso,
+    save_preferences,
     scan_existing,
     write_index,
     write_meeting_file,
@@ -200,8 +204,12 @@ class App(ctk.CTk):
         self.geometry("1080x780")
         self.minsize(880, 600)
 
+        # Persistent preferences
+        self.prefs: Preferences = load_preferences()
+
         # State
-        self.out_root = ctk.StringVar(value=str(DEFAULT_OUT_ROOT))
+        initial_out = self.prefs.output_folder or str(DEFAULT_OUT_ROOT)
+        self.out_root = ctk.StringVar(value=initial_out)
         self.docs: list[dict] = []                       # all meetings (after sort)
         self.checked: set[str] = set()                   # selected doc ids (across all pages)
         self.existing: set[str] = set()
@@ -213,6 +221,9 @@ class App(ctk.CTk):
         self.log_visible = False
         self.current_page = 0
         self.sort_key = "Date (newest first)"
+
+        # Auto-scan state
+        self._auto_scan_after_id: str | None = None
 
         # People-view state
         self.people_cache: list[dict] = []        # last aggregation
@@ -227,6 +238,8 @@ class App(ctk.CTk):
         self.after(100, self._drain_log)
         self.after(100, self._tick_token_status)
         self.after(200, self.refresh)
+        # Arm auto-scan if user enabled it last session
+        self.after(500, self._reschedule_auto_scan)
 
     # ---------- UI construction ----------
 
@@ -333,7 +346,7 @@ class App(ctk.CTk):
             font=f(13), text_color=TEXT_SECONDARY,
         ).pack(anchor="w", pady=(2, 0))
 
-        # Right: connection status chip
+        # Right: connection chip + settings button
         self.conn_chip = ctk.CTkLabel(
             header, text="● Connecting…",
             font=f(12, "bold"),
@@ -342,6 +355,15 @@ class App(ctk.CTk):
         )
         self.conn_chip.pack(side="right", anchor="ne", pady=(2, 0))
         self.conn_chip.bind("<Button-1>", lambda _e: self._on_chip_click())
+
+        ctk.CTkButton(
+            header, text="⚙  Settings", font=f(12),
+            fg_color=GHOST_BTN, hover_color=GHOST_BTN_HOVER,
+            text_color=GHOST_BTN_TEXT,
+            border_color=GHOST_BTN_BORDER, border_width=1,
+            corner_radius=8, height=30, width=110,
+            command=self._show_settings_dialog,
+        ).pack(side="right", anchor="ne", padx=(0, 10), pady=(2, 0))
 
     def _build_toolbar(self):
         bar = ctk.CTkFrame(self._meetings_container, fg_color=BG_PANEL, corner_radius=12,
@@ -804,6 +826,8 @@ class App(ctk.CTk):
         d = filedialog.askdirectory(initialdir=self.out_root.get(), title="Choose output folder")
         if d:
             self.out_root.set(d)
+            self.prefs.output_folder = d
+            save_preferences(self.prefs)
             self.refresh()
 
     def _open_folder(self):
@@ -1277,6 +1301,304 @@ class App(ctk.CTk):
                 child.configure(cursor="hand2")
             except tk.TclError:
                 pass
+
+    # ---------- Settings dialog + auto-scan ----------
+
+    AUTO_SCAN_INTERVAL_OPTIONS = {
+        "Every 15 minutes": 15,
+        "Every 30 minutes": 30,
+        "Every hour": 60,
+        "Every 2 hours": 120,
+        "Every 4 hours": 240,
+        "Every 8 hours": 480,
+    }
+
+    def _show_settings_dialog(self):
+        if hasattr(self, "_settings_win") and self._settings_win.winfo_exists():
+            self._settings_win.lift()
+            return
+
+        win = ctk.CTkToplevel(self)
+        self._settings_win = win
+        win.title("Settings")
+        win.geometry("520x520")
+        win.configure(fg_color=BG_WINDOW)
+        win.resizable(False, False)
+        win.transient(self)
+
+        ctk.CTkLabel(
+            win, text="Settings", font=f(20, "bold", display=True),
+            text_color=TEXT_PRIMARY,
+        ).pack(anchor="w", padx=22, pady=(20, 14))
+
+        # Section: Auto-scan
+        sec = ctk.CTkFrame(win, fg_color=BG_PANEL, corner_radius=12,
+                            border_width=1, border_color=BORDER)
+        sec.pack(fill="x", padx=22, pady=(0, 12))
+
+        ctk.CTkLabel(
+            sec, text="Auto-scan", font=f(14, "bold"), text_color=TEXT_PRIMARY,
+        ).pack(anchor="w", padx=18, pady=(14, 2))
+        ctk.CTkLabel(
+            sec,
+            text="Periodically check Granola for new meetings and export them in the background.",
+            font=f(12), text_color=TEXT_SECONDARY,
+            wraplength=440, justify="left",
+        ).pack(anchor="w", padx=18, pady=(0, 10))
+
+        # Toggle row
+        toggle_row = ctk.CTkFrame(sec, fg_color="transparent")
+        toggle_row.pack(fill="x", padx=18, pady=(0, 8))
+
+        self._settings_auto_scan_var = tk.BooleanVar(value=self.prefs.auto_scan_enabled)
+        ctk.CTkSwitch(
+            toggle_row, text="Enable auto-scan",
+            variable=self._settings_auto_scan_var,
+            font=f(13), text_color=TEXT_PRIMARY,
+            progress_color=ACCENT, button_color="#FFFFFF", button_hover_color="#FFFFFF",
+        ).pack(side="left")
+
+        # Interval row
+        interval_row = ctk.CTkFrame(sec, fg_color="transparent")
+        interval_row.pack(fill="x", padx=18, pady=(4, 14))
+
+        ctk.CTkLabel(
+            interval_row, text="Frequency:",
+            font=f(13), text_color=TEXT_SECONDARY,
+        ).pack(side="left")
+
+        # Map current interval back to its label
+        current_label = next(
+            (k for k, v in self.AUTO_SCAN_INTERVAL_OPTIONS.items()
+             if v == self.prefs.auto_scan_interval_minutes),
+            "Every 2 hours",
+        )
+        self._settings_interval_var = tk.StringVar(value=current_label)
+        ctk.CTkOptionMenu(
+            interval_row, values=list(self.AUTO_SCAN_INTERVAL_OPTIONS.keys()),
+            variable=self._settings_interval_var,
+            font=f(12),
+            fg_color=GHOST_BTN, button_color=GHOST_BTN, button_hover_color=GHOST_BTN_HOVER,
+            text_color=GHOST_BTN_TEXT, dropdown_fg_color=BG_PANEL,
+            dropdown_text_color=TEXT_PRIMARY, dropdown_hover_color=GHOST_BTN_HOVER,
+            corner_radius=6, height=28, width=180,
+        ).pack(side="left", padx=(8, 0))
+
+        # Notify row
+        self._settings_notify_var = tk.BooleanVar(value=self.prefs.notify_on_new)
+        ctk.CTkSwitch(
+            sec, text="Show macOS notification when new meetings are exported",
+            variable=self._settings_notify_var,
+            font=f(13), text_color=TEXT_PRIMARY,
+            progress_color=ACCENT,
+        ).pack(anchor="w", padx=18, pady=(0, 14))
+
+        # Section: Last scan info + manual trigger
+        info_sec = ctk.CTkFrame(win, fg_color=BG_PANEL, corner_radius=12,
+                                 border_width=1, border_color=BORDER)
+        info_sec.pack(fill="x", padx=22, pady=(0, 12))
+
+        ctk.CTkLabel(
+            info_sec, text="Last scan", font=f(14, "bold"), text_color=TEXT_PRIMARY,
+        ).pack(anchor="w", padx=18, pady=(14, 2))
+
+        last = self.prefs.last_scan_iso
+        last_dt = parse_iso(last) if last else None
+        if last_dt:
+            last_str = last_dt.astimezone().strftime("%a %b %d, %H:%M")
+            count_str = (f"  ·  {self.prefs.last_scan_new_count} new "
+                         f"({self.prefs.last_scan_fetched_count} with transcripts)")
+        else:
+            last_str = "Never"
+            count_str = ""
+
+        ctk.CTkLabel(
+            info_sec, text=last_str + count_str,
+            font=f(12), text_color=TEXT_SECONDARY,
+        ).pack(anchor="w", padx=18, pady=(0, 10))
+
+        ctk.CTkButton(
+            info_sec, text="Scan now", font=f(12),
+            fg_color=GHOST_BTN, hover_color=GHOST_BTN_HOVER,
+            text_color=GHOST_BTN_TEXT,
+            border_color=GHOST_BTN_BORDER, border_width=1,
+            corner_radius=8, height=30, width=110,
+            command=lambda: self._kick_auto_scan(manual=True),
+        ).pack(anchor="w", padx=18, pady=(0, 14))
+
+        # Footer: caveat + buttons
+        ctk.CTkLabel(
+            win,
+            text="Auto-scan only runs while the app is open.",
+            font=f(11), text_color=TEXT_TERTIARY,
+        ).pack(anchor="w", padx=22, pady=(0, 10))
+
+        btn_row = ctk.CTkFrame(win, fg_color="transparent")
+        btn_row.pack(side="bottom", fill="x", padx=22, pady=18)
+
+        ctk.CTkButton(
+            btn_row, text="Cancel", font=f(13),
+            fg_color=GHOST_BTN, hover_color=GHOST_BTN_HOVER,
+            text_color=GHOST_BTN_TEXT,
+            border_color=GHOST_BTN_BORDER, border_width=1,
+            corner_radius=8, height=34, width=90,
+            command=win.destroy,
+        ).pack(side="right", padx=(8, 0))
+
+        ctk.CTkButton(
+            btn_row, text="Save", font=f(13, "bold"),
+            fg_color=NEUTRAL_BTN, hover_color=NEUTRAL_BTN_HOVER,
+            text_color=NEUTRAL_BTN_TEXT, corner_radius=8,
+            height=34, width=90, command=self._save_settings,
+        ).pack(side="right")
+
+    def _save_settings(self):
+        self.prefs.auto_scan_enabled = self._settings_auto_scan_var.get()
+        self.prefs.notify_on_new = self._settings_notify_var.get()
+        label = self._settings_interval_var.get()
+        self.prefs.auto_scan_interval_minutes = self.AUTO_SCAN_INTERVAL_OPTIONS.get(label, 120)
+        save_preferences(self.prefs)
+        self._log(f"Settings saved (auto-scan={'on' if self.prefs.auto_scan_enabled else 'off'}, "
+                  f"every {self.prefs.auto_scan_interval_minutes}min)")
+        self._reschedule_auto_scan()
+        if self._settings_win.winfo_exists():
+            self._settings_win.destroy()
+
+    # ---------- auto-scan timer ----------
+
+    def _reschedule_auto_scan(self):
+        """Cancel any pending tick and reschedule based on current prefs."""
+        if self._auto_scan_after_id:
+            try:
+                self.after_cancel(self._auto_scan_after_id)
+            except Exception:
+                pass
+            self._auto_scan_after_id = None
+        if not self.prefs.auto_scan_enabled:
+            return
+        ms = max(60_000, self.prefs.auto_scan_interval_minutes * 60_000)
+        self._auto_scan_after_id = self.after(ms, self._auto_scan_tick)
+        self._log(f"Auto-scan armed — next check in "
+                  f"{self.prefs.auto_scan_interval_minutes} min")
+
+    def _auto_scan_tick(self):
+        """Periodic timer fired by self.after()."""
+        self._auto_scan_after_id = None
+        # Defer if user is busy interacting with the app
+        if self.worker_busy:
+            self._auto_scan_after_id = self.after(5 * 60_000, self._auto_scan_tick)
+            return
+        self._kick_auto_scan(manual=False)
+
+    def _kick_auto_scan(self, manual: bool = False):
+        """Run a scan in the background. manual=True is from 'Scan now' button."""
+        threading.Thread(
+            target=self._auto_scan_worker, args=(manual,), daemon=True,
+        ).start()
+
+    def _auto_scan_worker(self, manual: bool):
+        try:
+            # 1) Get fresh token (may have expired since last refresh)
+            try:
+                token, source, remaining = load_access_token()
+                self.token = token
+                self.token_remaining = remaining
+            except AuthError:
+                self._log("Auto-scan: skipping — no valid Granola session")
+                return
+
+            # 2) Reload meeting list
+            try:
+                docs = load_documents()
+            except Exception as e:
+                self._log(f"Auto-scan: cache load failed: {e}")
+                return
+
+            out_dir = Path(self.out_root.get()) / "transcripts"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            existing = scan_existing(out_dir)
+            new_docs = [d for d in docs if meeting_filename(d) not in existing]
+
+            if not new_docs:
+                self._log(f"Auto-scan: no new meetings ({len(docs)} total in Granola)")
+                self.prefs.last_scan_iso = datetime.now().isoformat(timespec="seconds")
+                self.prefs.last_scan_new_count = 0
+                self.prefs.last_scan_fetched_count = 0
+                save_preferences(self.prefs)
+                return
+
+            # 3) Fetch + write each new meeting
+            self._log(f"Auto-scan: found {len(new_docs)} new meetings, exporting…")
+            entries_by_name = {m.filename: m for m in collect_existing_meta(out_dir)}
+            fetched = errors = 0
+            for doc in new_docs:
+                title = doc.get("title") or "Untitled"
+                segments = None
+                try:
+                    resp = fetch_transcript(doc["id"], self.token)
+                    if isinstance(resp, list):
+                        segments = resp
+                        if segments:
+                            fetched += 1
+                    elif isinstance(resp, dict):
+                        for k in ("transcript", "segments", "data"):
+                            if isinstance(resp.get(k), list):
+                                segments = resp[k]
+                                if segments:
+                                    fetched += 1
+                                break
+                except urllib.error.HTTPError as e:
+                    if e.code in (401, 403):
+                        self._log("Auto-scan: token expired mid-scan — stopping")
+                        return
+                    errors += 1
+                    self._log(f"  Auto-scan HTTP {e.code} for {title}")
+                    continue
+                except Exception as e:
+                    errors += 1
+                    self._log(f"  Auto-scan error: {e}")
+                    continue
+
+                try:
+                    _, meta = write_meeting_file(out_dir, doc, segments)
+                    entries_by_name[meta.filename] = meta
+                except Exception as e:
+                    errors += 1
+                    self._log(f"  Auto-scan write error: {e}")
+
+            try:
+                write_index(Path(self.out_root.get()), list(entries_by_name.values()))
+            except Exception as e:
+                self._log(f"Auto-scan index error: {e}")
+
+            self._log(
+                f"Auto-scan complete · {len(new_docs)} new · {fetched} with transcripts · {errors} errors"
+            )
+
+            # 4) Persist scan stats
+            self.prefs.last_scan_iso = datetime.now().isoformat(timespec="seconds")
+            self.prefs.last_scan_new_count = len(new_docs)
+            self.prefs.last_scan_fetched_count = fetched
+            save_preferences(self.prefs)
+
+            # 5) macOS notification + UI refresh
+            if self.prefs.notify_on_new and len(new_docs) > 0:
+                msg = (f"{len(new_docs)} new meeting{'s' if len(new_docs) != 1 else ''} exported"
+                       + (f" — {fetched} with transcripts" if fetched else ""))
+                notify_macos(title="Granola Export", message=msg)
+
+            # Refresh the visible list so new pills flip + counts update
+            self.after(0, self.refresh)
+
+        except Exception as e:
+            self._log(f"Auto-scan unexpected error: {type(e).__name__}: {e}")
+        finally:
+            # Schedule the next one, unless this was a manual click
+            if not manual:
+                self.after(0, self._reschedule_auto_scan)
+            else:
+                # Manual run: still re-arm if enabled, but reset timer to a full interval
+                self.after(0, self._reschedule_auto_scan)
 
     def _show_data_info(self):
         """Modal explaining where the meeting list + transcripts come from."""
