@@ -83,6 +83,7 @@ FONT_FAMILY = "SF Pro Text"
 FONT_FAMILY_DISPLAY = "SF Pro Display"
 
 PAGE_SIZE = 50
+PEOPLE_PAGE_SIZE = 50
 
 # Avatar colours for the People view (cycled by hashing the email/name)
 AVATAR_COLORS = [
@@ -212,6 +213,11 @@ class App(ctk.CTk):
         self.current_page = 0
         self.sort_key = "Date (newest first)"
 
+        # People-view state
+        self.people_cache: list[dict] = []        # last aggregation
+        self.people_filtered: list[dict] = []     # after search filter
+        self.people_current_page = 0
+
         # Auth-watch state (set when waiting for token refresh)
         self._auth_watch_active = False
         self._auth_watch_after_id = None
@@ -250,25 +256,46 @@ class App(ctk.CTk):
         self._show_view("meetings")
 
     def _build_main_nav(self):
+        """Custom segmented-button using two CTkButtons so we can colour the
+        selected text white against the dark background."""
         nav_row = ctk.CTkFrame(self, fg_color="transparent", height=44)
         nav_row.pack(fill="x", padx=24, pady=(0, 8))
         nav_row.pack_propagate(False)
 
-        self.nav_segmented = ctk.CTkSegmentedButton(
-            nav_row, values=["Meetings", "People"],
-            font=f(13, "bold"),
-            fg_color=BG_PANEL, selected_color=NEUTRAL_BTN,
-            selected_hover_color=NEUTRAL_BTN_HOVER,
-            unselected_color=BG_PANEL, unselected_hover_color=GHOST_BTN_HOVER,
-            text_color=TEXT_PRIMARY, text_color_disabled=TEXT_TERTIARY,
-            corner_radius=10, height=34,
-            command=self._on_nav_change,
-        )
-        self.nav_segmented.set("Meetings")
-        self.nav_segmented.pack(side="left")
+        nav_wrap = ctk.CTkFrame(nav_row, fg_color=BG_PANEL, corner_radius=10,
+                                border_width=1, border_color=BORDER)
+        nav_wrap.pack(side="left")
 
-    def _on_nav_change(self, choice: str):
+        self.nav_buttons: dict[str, ctk.CTkButton] = {}
+        for label in ("Meetings", "People"):
+            btn = ctk.CTkButton(
+                nav_wrap, text=label, font=f(13, "bold"),
+                corner_radius=8, height=30, width=110,
+                command=lambda l=label: self._set_nav(l),
+            )
+            btn.pack(side="left", padx=4, pady=4)
+            self.nav_buttons[label] = btn
+
+        self._current_nav = "Meetings"
+        self._update_nav_styling()
+
+    def _set_nav(self, choice: str):
+        self._current_nav = choice
+        self._update_nav_styling()
         self._show_view("people" if choice == "People" else "meetings")
+
+    def _update_nav_styling(self):
+        for label, btn in self.nav_buttons.items():
+            if label == self._current_nav:
+                btn.configure(
+                    fg_color=NEUTRAL_BTN, hover_color=NEUTRAL_BTN_HOVER,
+                    text_color=NEUTRAL_BTN_TEXT,
+                )
+            else:
+                btn.configure(
+                    fg_color="transparent", hover_color=GHOST_BTN_HOVER,
+                    text_color=TEXT_PRIMARY,
+                )
 
     def _show_view(self, name: str):
         self._meetings_frame.pack_forget()
@@ -839,16 +866,13 @@ class App(ctk.CTk):
 
     def _build_people_view(self):
         """Build the People list + Contact detail sub-views inside _people_frame."""
-        # We toggle between two sub-views:
-        #   _people_list_frame   — table of all contacts
-        #   _people_detail_frame — single contact with their meetings
         self._people_list_frame = ctk.CTkFrame(self._people_frame, fg_color="transparent")
         self._people_detail_frame = ctk.CTkFrame(self._people_frame, fg_color="transparent")
         self._people_list_frame.pack(fill="both", expand=True)
 
-        # ----- list header row (column titles + search placeholder) -----
+        # ----- title row -----
         list_header = ctk.CTkFrame(self._people_list_frame, fg_color="transparent", height=44)
-        list_header.pack(fill="x", padx=24, pady=(8, 8))
+        list_header.pack(fill="x", padx=24, pady=(8, 6))
         list_header.pack_propagate(False)
 
         ctk.CTkLabel(
@@ -861,8 +885,32 @@ class App(ctk.CTk):
         )
         self.people_count_label.pack(side="left", padx=(10, 0), pady=(8, 0))
 
+        # ----- search bar -----
+        search_row = ctk.CTkFrame(self._people_list_frame, fg_color="transparent", height=40)
+        search_row.pack(fill="x", padx=24, pady=(0, 8))
+        search_row.pack_propagate(False)
+
+        search_wrap = ctk.CTkFrame(
+            search_row, fg_color=BG_PANEL, corner_radius=8,
+            border_width=1, border_color=BORDER, height=34,
+        )
+        search_wrap.pack(side="left", fill="x", expand=True)
+        ctk.CTkLabel(
+            search_wrap, text="🔍", font=f(13), text_color=TEXT_TERTIARY,
+        ).pack(side="left", padx=(10, 4))
+
+        self.people_search_var = tk.StringVar()
+        self.people_search_var.trace_add("write", lambda *_a: self._on_people_search_change())
+        ctk.CTkEntry(
+            search_wrap, textvariable=self.people_search_var,
+            placeholder_text="Search by name, email, or domain…",
+            font=f(13), fg_color=BG_PANEL, border_width=0,
+            text_color=TEXT_PRIMARY, placeholder_text_color=TEXT_TERTIARY,
+            height=30,
+        ).pack(side="left", fill="x", expand=True, padx=(0, 10))
+
         # ----- column headers -----
-        col_headers = ctk.CTkFrame(self._people_list_frame, fg_color="transparent", height=24)
+        col_headers = ctk.CTkFrame(self._people_list_frame, fg_color="transparent", height=22)
         col_headers.pack(fill="x", padx=28, pady=(0, 4))
         col_headers.pack_propagate(False)
         ctk.CTkLabel(col_headers, text="Person", font=f(11, "bold"),
@@ -875,7 +923,7 @@ class App(ctk.CTk):
         # ----- scrollable people list -----
         list_wrap = ctk.CTkFrame(self._people_list_frame, fg_color=BG_PANEL,
                                   corner_radius=12, border_width=1, border_color=BORDER)
-        list_wrap.pack(fill="both", expand=True, padx=24, pady=(0, 16))
+        list_wrap.pack(fill="both", expand=True, padx=24, pady=(0, 8))
 
         self.people_scroll = ctk.CTkScrollableFrame(
             list_wrap, fg_color=BG_PANEL, corner_radius=10,
@@ -883,24 +931,110 @@ class App(ctk.CTk):
         )
         self.people_scroll.pack(fill="both", expand=True, padx=8, pady=8)
 
-    def _render_people_list(self):
-        """Re-aggregate and render the people list."""
-        people = aggregate_people(self.docs) if self.docs else []
-        self.people_count_label.configure(text=f"· {len(people)} contact{'s' if len(people) != 1 else ''}")
+        # ----- pagination row -----
+        pag_row = ctk.CTkFrame(self._people_list_frame, fg_color="transparent", height=34)
+        pag_row.pack(fill="x", padx=24, pady=(0, 12))
+        pag_row.pack_propagate(False)
 
-        # Clear
+        self.btn_people_prev = ctk.CTkButton(
+            pag_row, text="← Previous", font=f(12),
+            fg_color=GHOST_BTN, hover_color=GHOST_BTN_HOVER,
+            text_color=GHOST_BTN_TEXT,
+            border_color=GHOST_BTN_BORDER, border_width=1,
+            corner_radius=6, height=28, width=100, command=self._people_prev_page,
+        )
+        self.btn_people_prev.pack(side="left")
+
+        self.people_page_label = ctk.CTkLabel(
+            pag_row, text="Page 1 of 1", font=f(12), text_color=TEXT_SECONDARY,
+        )
+        self.people_page_label.pack(side="left", padx=12)
+
+        self.btn_people_next = ctk.CTkButton(
+            pag_row, text="Next →", font=f(12),
+            fg_color=GHOST_BTN, hover_color=GHOST_BTN_HOVER,
+            text_color=GHOST_BTN_TEXT,
+            border_color=GHOST_BTN_BORDER, border_width=1,
+            corner_radius=6, height=28, width=80, command=self._people_next_page,
+        )
+        self.btn_people_next.pack(side="left")
+
+    def _render_people_list(self):
+        """Re-aggregate, then render the first page."""
+        self.people_cache = aggregate_people(self.docs) if self.docs else []
+        # If a search query was in effect, re-apply it; otherwise show all
+        query = self.people_search_var.get().strip().lower() if hasattr(self, "people_search_var") else ""
+        self.people_filtered = self._filter_people(query)
+        self.people_count_label.configure(
+            text=f"· {len(self.people_cache)} contact{'s' if len(self.people_cache) != 1 else ''}"
+        )
+        self.people_current_page = 0
+        self._render_people_page()
+
+    def _filter_people(self, query: str) -> list[dict]:
+        if not query:
+            return list(self.people_cache)
+        q = query.lower()
+        return [
+            p for p in self.people_cache
+            if q in (p.get("name") or "").lower()
+            or q in (p.get("email") or "").lower()
+            or q in (p.get("domain") or "").lower()
+        ]
+
+    def _on_people_search_change(self):
+        query = self.people_search_var.get().strip().lower()
+        self.people_filtered = self._filter_people(query)
+        self.people_current_page = 0
+        self._render_people_page()
+
+    def _render_people_page(self):
+        # Clear current rows
         for w in list(self.people_scroll.winfo_children()):
             w.destroy()
 
-        if not people:
+        if not self.people_filtered:
+            empty_msg = ("No matches — try a different search."
+                         if self.people_search_var.get().strip()
+                         else "No people detected yet — click Refresh on the Meetings tab first.")
             ctk.CTkLabel(
-                self.people_scroll, text="No people detected yet — click Refresh on the Meetings tab first.",
+                self.people_scroll, text=empty_msg,
                 font=f(13), text_color=TEXT_TERTIARY,
             ).pack(pady=60)
+            self._update_people_pagination()
             return
 
-        for person in people:
+        start = self.people_current_page * PEOPLE_PAGE_SIZE
+        end = start + PEOPLE_PAGE_SIZE
+        for person in self.people_filtered[start:end]:
             self._build_person_row(person)
+        self._update_people_pagination()
+        try:
+            self.people_scroll._parent_canvas.yview_moveto(0)
+        except Exception:
+            pass
+
+    def _update_people_pagination(self):
+        n = len(self.people_filtered)
+        total = max(1, (n + PEOPLE_PAGE_SIZE - 1) // PEOPLE_PAGE_SIZE)
+        showing_from = self.people_current_page * PEOPLE_PAGE_SIZE + 1 if n else 0
+        showing_to = min((self.people_current_page + 1) * PEOPLE_PAGE_SIZE, n)
+        self.people_page_label.configure(
+            text=f"Page {self.people_current_page + 1} of {total}  ·  showing {showing_from}–{showing_to} of {n}"
+        )
+        self.btn_people_prev.configure(state="normal" if self.people_current_page > 0 else "disabled")
+        self.btn_people_next.configure(state="normal" if self.people_current_page < total - 1 else "disabled")
+
+    def _people_prev_page(self):
+        if self.people_current_page > 0:
+            self.people_current_page -= 1
+            self._render_people_page()
+
+    def _people_next_page(self):
+        total = max(1, (len(self.people_filtered) + PEOPLE_PAGE_SIZE - 1) // PEOPLE_PAGE_SIZE)
+        if self.people_current_page < total - 1:
+            self.people_current_page += 1
+            self._render_people_page()
 
     def _build_person_row(self, person: dict):
         row = ctk.CTkFrame(self.people_scroll, fg_color=BG_CARD, corner_radius=8, height=58)
