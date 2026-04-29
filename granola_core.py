@@ -20,8 +20,23 @@ CACHE_FILE = GRANOLA_DIR / "cache-v6.json"
 API_BASE = "https://api.granola.ai/v1"
 CLIENT_VERSION = "5.354.0"
 
-# Default output folder — sibling to this file.
-DEFAULT_OUT_ROOT = Path(__file__).resolve().parent
+# Default output folder.
+# - When bundled (PyInstaller .app from a DMG, /Applications, etc.) the script
+#   path is read-only, so use ~/Documents/Granola Export/.
+# - When running from source, write next to the source files.
+def _default_out_root() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path.home() / "Documents" / "Granola Export"
+    here = Path(__file__).resolve().parent
+    # Treat any path that's clearly inside a .app bundle or a /Volumes mount as
+    # read-only and fall back to ~/Documents.
+    parts = here.parts
+    if any(p.endswith(".app") for p in parts) or (parts and parts[0] == "/" and len(parts) > 1 and parts[1] == "Volumes"):
+        return Path.home() / "Documents" / "Granola Export"
+    return here
+
+
+DEFAULT_OUT_ROOT = _default_out_root()
 
 # Speaker label rename: system audio = the other party, mic = the user.
 SPEAKER_LABELS = {

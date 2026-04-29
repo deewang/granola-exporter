@@ -222,18 +222,21 @@ class App(ctk.CTk):
         ).pack(side="right", padx=(0, 8))
 
     def _build_summary_bar(self):
-        bar = ctk.CTkFrame(self, fg_color="transparent", height=30)
+        bar = ctk.CTkFrame(self, fg_color="transparent", height=52)
         bar.pack(fill="x", padx=28, pady=(0, 8))
         bar.pack_propagate(False)
 
-        # Left: summary stats + info link
+        # Two-row layout: top row = stats + info link, bottom row = output path
+        top_row = ctk.CTkFrame(bar, fg_color="transparent")
+        top_row.pack(fill="x", anchor="n")
+
         self.summary_label = ctk.CTkLabel(
-            bar, text="Loading…", font=f(12), text_color=TEXT_SECONDARY,
+            top_row, text="Loading…", font=f(12), text_color=TEXT_SECONDARY,
         )
         self.summary_label.pack(side="left")
 
         info_link = ctk.CTkLabel(
-            bar, text="ⓘ Where does this data come from?",
+            top_row, text="ⓘ Where does this data come from?",
             font=ctk.CTkFont(family=FONT_FAMILY, size=12, underline=True),
             text_color=TEXT_SECONDARY, cursor="hand2",
         )
@@ -244,17 +247,17 @@ class App(ctk.CTk):
 
         # Right: selected count
         self.selected_label = ctk.CTkLabel(
-            bar, text="0 selected", font=f(12, "bold"), text_color=TEXT_PRIMARY,
+            top_row, text="0 selected", font=f(12, "bold"), text_color=TEXT_PRIMARY,
         )
         self.selected_label.pack(side="right")
 
         # Sort dropdown next to selected count
         ctk.CTkLabel(
-            bar, text="Sort:", font=f(12), text_color=TEXT_SECONDARY,
+            top_row, text="Sort:", font=f(12), text_color=TEXT_SECONDARY,
         ).pack(side="right", padx=(0, 6))
 
         self.sort_menu = ctk.CTkOptionMenu(
-            bar, values=list(SORT_OPTIONS.keys()),
+            top_row, values=list(SORT_OPTIONS.keys()),
             font=f(12),
             fg_color=GHOST_BTN, button_color=GHOST_BTN, button_hover_color=GHOST_BTN_HOVER,
             text_color=GHOST_BTN_TEXT, dropdown_fg_color=BG_PANEL,
@@ -264,6 +267,35 @@ class App(ctk.CTk):
         )
         self.sort_menu.set(self.sort_key)
         self.sort_menu.pack(side="right", padx=(0, 14))
+
+        # Bottom row: shows the output folder so users always know where exports land
+        bottom_row = ctk.CTkFrame(bar, fg_color="transparent")
+        bottom_row.pack(fill="x", anchor="s", pady=(2, 0))
+
+        ctk.CTkLabel(
+            bottom_row, text="Saving to:", font=f(11), text_color=TEXT_TERTIARY,
+        ).pack(side="left")
+        self.path_label = ctk.CTkLabel(
+            bottom_row, text=self._short_path(self.out_root.get()),
+            font=f(11, "bold"), text_color=TEXT_SECONDARY,
+        )
+        self.path_label.pack(side="left", padx=(4, 0))
+        # Keep label in sync if user changes the folder
+        self.out_root.trace_add("write", lambda *_a: self.path_label.configure(
+            text=self._short_path(self.out_root.get())
+        ))
+
+    def _short_path(self, path_str: str) -> str:
+        """Display a friendly version of the output path: ~/foo/bar/transcripts/"""
+        try:
+            p = Path(path_str)
+            home = Path.home()
+            if p == home or home in p.parents:
+                rel = p.relative_to(home)
+                return f"~/{rel}/transcripts/"
+            return f"{p}/transcripts/"
+        except Exception:
+            return path_str
 
     def _build_meeting_list(self):
         wrap = ctk.CTkFrame(self, fg_color=BG_PANEL, corner_radius=12,
