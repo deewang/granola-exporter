@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Granola Export — desktop GUI.
+"""Granola Export — modern macOS GUI inspired by Granola's design.
 
 Workflow:
-  1. Click "Refresh from Granola" → loads all meetings, marks NEW ones.
+  1. App auto-loads on launch and marks any NEW meetings.
   2. Tick the rows you want (or use Select New / Select All).
   3. Click "Export Selected" → writes Markdown + updates INDEX.md.
 """
@@ -13,7 +13,9 @@ import time
 import tkinter as tk
 import urllib.error
 from pathlib import Path
-from tkinter import ttk, filedialog, messagebox
+
+import customtkinter as ctk
+from tkinter import filedialog, messagebox
 
 from granola_core import (
     AuthError,
@@ -29,211 +31,434 @@ from granola_core import (
     write_meeting_file,
 )
 
+# ---------- design tokens (Granola-inspired warm light theme) ----------
 
-class App(tk.Tk):
+BG_WINDOW = "#F7F4EE"          # warm cream window background
+BG_CARD = "#FFFFFF"            # meeting row background
+BG_CARD_HOVER = "#FBF8F1"
+BG_CARD_NEW = "#FEF7DD"        # warm yellow tint for new items
+BG_CARD_NEW_HOVER = "#FBF1C9"
+BG_PANEL = "#FFFFFF"           # toolbar / log panel
+BORDER = "#E8E3D9"
+BORDER_LIGHT = "#F0EBDF"
+
+TEXT_PRIMARY = "#1F1B16"
+TEXT_SECONDARY = "#736D62"
+TEXT_TERTIARY = "#A8A095"
+TEXT_ON_ACCENT = "#FFFFFF"
+
+ACCENT = "#0F8A47"             # export button green
+ACCENT_HOVER = "#0C7038"
+
+NEUTRAL_BTN = "#1F1B16"
+NEUTRAL_BTN_HOVER = "#3A342B"
+NEUTRAL_BTN_TEXT = "#FFFFFF"
+
+GHOST_BTN = "#FFFFFF"
+GHOST_BTN_HOVER = "#F4F0E7"
+GHOST_BTN_TEXT = "#1F1B16"
+GHOST_BTN_BORDER = "#E0DBD0"
+
+DOT_NEW = "#F59E0B"
+DOT_EXPORTED = "#10B981"
+
+PILL_NEW_BG = "#FFEBC2"
+PILL_NEW_FG = "#92400E"
+PILL_EXPORTED_BG = "#E5F4EB"
+PILL_EXPORTED_FG = "#0F5E2C"
+
+DANGER = "#DC2626"
+
+FONT_FAMILY = "SF Pro Text"
+FONT_FAMILY_DISPLAY = "SF Pro Display"
+
+
+def f(size, weight="normal", display=False):
+    family = FONT_FAMILY_DISPLAY if display else FONT_FAMILY
+    return ctk.CTkFont(family=family, size=size, weight=weight)
+
+
+# ---------- main app ----------
+
+class App(ctk.CTk):
     def __init__(self):
-        super().__init__()
+        ctk.set_appearance_mode("light")
+        super().__init__(fg_color=BG_WINDOW)
         self.title("Granola Export")
-        self.geometry("1100x680")
-        self.minsize(800, 500)
+        self.geometry("1080x740")
+        self.minsize(880, 560)
 
-        self.out_root = tk.StringVar(value=str(DEFAULT_OUT_ROOT))
+        self.out_root = ctk.StringVar(value=str(DEFAULT_OUT_ROOT))
         self.docs: list[dict] = []
-        self.checked: set[str] = set()  # doc ids
-        self.existing: set[str] = set()  # filenames
+        self.checked: set[str] = set()
+        self.existing: set[str] = set()
         self.token: str | None = None
         self.log_q: queue.Queue = queue.Queue()
         self.worker_busy = False
+        self.row_widgets: dict[str, dict] = {}
+        self.log_visible = False
 
         self._build_ui()
         self.after(100, self._drain_log)
-        # Auto-refresh on launch
         self.after(200, self.refresh)
 
-    # ---------- UI ----------
+    # ---------- UI construction ----------
 
     def _build_ui(self):
-        # Top bar
-        top = ttk.Frame(self, padding=10)
-        top.pack(fill="x")
+        self._build_header()
+        self._build_toolbar()
+        self._build_summary_bar()
+        self._build_meeting_list()
+        self._build_footer()
 
-        self.status_var = tk.StringVar(value="Idle")
-        ttk.Label(top, textvariable=self.status_var, font=("SF Pro", 12, "bold")).pack(side="left")
+    def _build_header(self):
+        header = ctk.CTkFrame(self, fg_color="transparent", height=72)
+        header.pack(fill="x", padx=24, pady=(20, 8))
+        header.pack_propagate(False)
 
-        ttk.Label(top, text="  Output:").pack(side="left", padx=(20, 4))
-        ttk.Entry(top, textvariable=self.out_root, width=50).pack(side="left")
-        ttk.Button(top, text="…", width=3, command=self._pick_folder).pack(side="left", padx=4)
-        ttk.Button(top, text="Open Folder", command=self._open_folder).pack(side="left", padx=4)
+        ctk.CTkLabel(
+            header, text="Granola Export",
+            font=f(26, "bold", display=True), text_color=TEXT_PRIMARY,
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            header, text="Export your meetings as Markdown — sortable, indexed, AI-ready.",
+            font=f(13), text_color=TEXT_SECONDARY,
+        ).pack(anchor="w", pady=(2, 0))
 
-        # Action bar
-        actions = ttk.Frame(self, padding=(10, 0))
-        actions.pack(fill="x")
+    def _build_toolbar(self):
+        bar = ctk.CTkFrame(self, fg_color=BG_PANEL, corner_radius=12,
+                           border_width=1, border_color=BORDER)
+        bar.pack(fill="x", padx=24, pady=(0, 12))
 
-        self.btn_refresh = ttk.Button(actions, text="🔄 Refresh from Granola", command=self.refresh)
+        inner = ctk.CTkFrame(bar, fg_color="transparent")
+        inner.pack(fill="x", padx=14, pady=12)
+
+        self.btn_refresh = ctk.CTkButton(
+            inner, text="↻  Refresh", font=f(13, "bold"),
+            fg_color=NEUTRAL_BTN, hover_color=NEUTRAL_BTN_HOVER,
+            text_color=NEUTRAL_BTN_TEXT, corner_radius=8,
+            width=100, height=34, command=self.refresh,
+        )
         self.btn_refresh.pack(side="left")
 
-        ttk.Button(actions, text="Select New", command=self._select_new).pack(side="left", padx=(20, 4))
-        ttk.Button(actions, text="Select All", command=self._select_all).pack(side="left", padx=4)
-        ttk.Button(actions, text="Clear", command=self._select_none).pack(side="left", padx=4)
+        for label, fn in [
+            ("Select new", self._select_new),
+            ("All", self._select_all),
+            ("Clear", self._select_none),
+        ]:
+            ctk.CTkButton(
+                inner, text=label, font=f(13),
+                fg_color=GHOST_BTN, hover_color=GHOST_BTN_HOVER,
+                text_color=GHOST_BTN_TEXT,
+                border_color=GHOST_BTN_BORDER, border_width=1,
+                corner_radius=8, height=34, width=90, command=fn,
+            ).pack(side="left", padx=(8, 0))
 
-        self.btn_export = ttk.Button(actions, text="⬇  Export Selected", command=self.export, style="Accent.TButton")
+        self.btn_export = ctk.CTkButton(
+            inner, text="Export selected  →", font=f(13, "bold"),
+            fg_color=ACCENT, hover_color=ACCENT_HOVER,
+            text_color=TEXT_ON_ACCENT, corner_radius=8,
+            width=170, height=34, command=self.export,
+        )
         self.btn_export.pack(side="right")
-        self.selected_count = tk.StringVar(value="0 selected")
-        ttk.Label(actions, textvariable=self.selected_count).pack(side="right", padx=10)
 
-        # Treeview
-        tree_frame = ttk.Frame(self, padding=10)
-        tree_frame.pack(fill="both", expand=True)
+        ctk.CTkButton(
+            inner, text="Open folder", font=f(13),
+            fg_color=GHOST_BTN, hover_color=GHOST_BTN_HOVER,
+            text_color=GHOST_BTN_TEXT,
+            border_color=GHOST_BTN_BORDER, border_width=1,
+            corner_radius=8, height=34, width=110, command=self._open_folder,
+        ).pack(side="right", padx=(0, 8))
 
-        cols = ("check", "status", "date", "title", "participants")
-        self.tree = ttk.Treeview(tree_frame, columns=cols, show="headings", selectmode="extended")
-        self.tree.heading("check", text="✓")
-        self.tree.heading("status", text="Status")
-        self.tree.heading("date", text="Date")
-        self.tree.heading("title", text="Title")
-        self.tree.heading("participants", text="Participants")
-        self.tree.column("check", width=36, anchor="center", stretch=False)
-        self.tree.column("status", width=90, anchor="w", stretch=False)
-        self.tree.column("date", width=140, anchor="w", stretch=False)
-        self.tree.column("title", width=400, anchor="w")
-        self.tree.column("participants", width=300, anchor="w")
+        ctk.CTkButton(
+            inner, text="Choose…", font=f(13),
+            fg_color=GHOST_BTN, hover_color=GHOST_BTN_HOVER,
+            text_color=GHOST_BTN_TEXT,
+            border_color=GHOST_BTN_BORDER, border_width=1,
+            corner_radius=8, height=34, width=80, command=self._pick_folder,
+        ).pack(side="right", padx=(0, 8))
 
-        self.tree.tag_configure("new", background="#E8F4FD")
-        self.tree.tag_configure("exported", foreground="#666")
+    def _build_summary_bar(self):
+        bar = ctk.CTkFrame(self, fg_color="transparent", height=22)
+        bar.pack(fill="x", padx=28, pady=(0, 10))
+        bar.pack_propagate(False)
+        self.summary_label = ctk.CTkLabel(
+            bar, text="Loading…", font=f(12), text_color=TEXT_SECONDARY,
+        )
+        self.summary_label.pack(side="left")
 
-        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=vsb.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        vsb.pack(side="right", fill="y")
+        self.selected_label = ctk.CTkLabel(
+            bar, text="0 selected", font=f(12, "bold"), text_color=TEXT_PRIMARY,
+        )
+        self.selected_label.pack(side="right")
 
-        self.tree.bind("<Button-1>", self._on_tree_click)
-        self.tree.bind("<space>", self._on_space)
+    def _build_meeting_list(self):
+        wrap = ctk.CTkFrame(self, fg_color=BG_PANEL, corner_radius=12,
+                            border_width=1, border_color=BORDER)
+        wrap.pack(fill="both", expand=True, padx=24, pady=(0, 12))
 
-        # Progress + log
-        bottom = ttk.Frame(self, padding=10)
-        bottom.pack(fill="x")
+        self.list_frame = ctk.CTkScrollableFrame(
+            wrap, fg_color=BG_PANEL, corner_radius=10,
+            scrollbar_button_color=BORDER,
+            scrollbar_button_hover_color=TEXT_TERTIARY,
+        )
+        self.list_frame.pack(fill="both", expand=True, padx=8, pady=8)
 
-        self.progress = ttk.Progressbar(bottom, mode="determinate")
+    def _build_footer(self):
+        footer = ctk.CTkFrame(self, fg_color="transparent")
+        footer.pack(fill="x", padx=24, pady=(0, 18))
+
+        self.progress = ctk.CTkProgressBar(
+            footer, height=6, corner_radius=4,
+            progress_color=ACCENT, fg_color=BORDER_LIGHT,
+        )
         self.progress.pack(fill="x")
+        self.progress.set(0)
 
-        self.log_text = tk.Text(bottom, height=6, wrap="word", state="disabled",
-                                 background="#F5F5F7", relief="flat", font=("Menlo", 11))
-        self.log_text.pack(fill="x", pady=(8, 0))
+        status_row = ctk.CTkFrame(footer, fg_color="transparent")
+        status_row.pack(fill="x", pady=(8, 0))
 
-        # Style accent button
-        style = ttk.Style()
-        try:
-            style.theme_use("aqua")
-        except tk.TclError:
-            pass
-        style.configure("Accent.TButton", font=("SF Pro", 12, "bold"))
+        self.status_label = ctk.CTkLabel(
+            status_row, text="Ready", font=f(12), text_color=TEXT_SECONDARY,
+        )
+        self.status_label.pack(side="left")
 
-    # ---------- helpers ----------
+        self.toggle_log_btn = ctk.CTkButton(
+            status_row, text="▸ Show log", font=f(12),
+            fg_color="transparent", hover_color=GHOST_BTN_HOVER,
+            text_color=TEXT_SECONDARY, border_width=0, corner_radius=6,
+            width=90, height=22, command=self._toggle_log,
+        )
+        self.toggle_log_btn.pack(side="right")
+
+        # Log panel (hidden until toggled or auto-shown on first write)
+        self.log_frame = ctk.CTkFrame(self, fg_color=BG_PANEL, corner_radius=10,
+                                       border_width=1, border_color=BORDER)
+        self.log_text = ctk.CTkTextbox(
+            self.log_frame, height=110,
+            fg_color=BG_PANEL, text_color=TEXT_SECONDARY,
+            font=ctk.CTkFont(family="Menlo", size=11),
+            border_width=0,
+        )
+        self.log_text.pack(fill="x", padx=12, pady=10)
+        self.log_text.configure(state="disabled")
+
+    # ---------- meeting row rendering ----------
+
+    def _clear_list(self):
+        for w in list(self.list_frame.winfo_children()):
+            w.destroy()
+        self.row_widgets.clear()
+
+    def _build_row(self, doc: dict):
+        is_new = meeting_filename(doc) not in self.existing
+        bg = BG_CARD_NEW if is_new else BG_CARD
+        hover = BG_CARD_NEW_HOVER if is_new else BG_CARD_HOVER
+
+        row = ctk.CTkFrame(self.list_frame, fg_color=bg, corner_radius=8, height=64)
+        row.pack(fill="x", padx=4, pady=3)
+        row.pack_propagate(False)
+
+        check_var = tk.BooleanVar(value=False)
+        check = ctk.CTkCheckBox(
+            row, text="", variable=check_var, width=24,
+            checkbox_width=20, checkbox_height=20,
+            fg_color=ACCENT, hover_color=ACCENT_HOVER,
+            border_color=BORDER, border_width=2, corner_radius=5,
+            command=lambda did=doc["id"], var=check_var: self._toggle(did, var.get()),
+        )
+        check.pack(side="left", padx=(16, 12))
+
+        if is_new:
+            dot_color, pill_bg, pill_fg, pill_text = DOT_NEW, PILL_NEW_BG, PILL_NEW_FG, "NEW"
+        else:
+            dot_color, pill_bg, pill_fg, pill_text = DOT_EXPORTED, PILL_EXPORTED_BG, PILL_EXPORTED_FG, "EXPORTED"
+
+        dot = ctk.CTkFrame(row, width=8, height=8, fg_color=dot_color, corner_radius=4)
+        dot.pack(side="left", padx=(0, 10))
+
+        text_col = ctk.CTkFrame(row, fg_color="transparent")
+        text_col.pack(side="left", fill="both", expand=True, padx=(0, 12))
+
+        title = doc.get("title") or "Untitled"
+        title_lbl = ctk.CTkLabel(
+            text_col, text=title, font=f(14, "bold"),
+            text_color=TEXT_PRIMARY, anchor="w",
+        )
+        title_lbl.pack(anchor="w", pady=(8, 0))
+
+        people_names = self._extract_people_short(doc)
+        meta_lbl = ctk.CTkLabel(
+            text_col, text=people_names or "—",
+            font=f(12), text_color=TEXT_SECONDARY, anchor="w",
+        )
+        meta_lbl.pack(anchor="w")
+
+        right = ctk.CTkFrame(row, fg_color="transparent")
+        right.pack(side="right", padx=(8, 16))
+
+        pill = ctk.CTkLabel(
+            right, text=pill_text, font=f(10, "bold"),
+            text_color=pill_fg, fg_color=pill_bg,
+            corner_radius=10, padx=10, pady=2,
+        )
+        pill.pack(anchor="e", pady=(8, 0))
+
+        dt = parse_iso(doc.get("created_at"))
+        date_str = dt.astimezone().strftime("%a %b %d, %H:%M") if dt else "—"
+        ctk.CTkLabel(
+            right, text=date_str, font=f(11),
+            text_color=TEXT_TERTIARY, anchor="e",
+        ).pack(anchor="e", pady=(2, 0))
+
+        # Whole-row click toggles checkbox (except on the checkbox itself)
+        for w in (text_col, title_lbl, meta_lbl, right, dot, pill):
+            w.bind("<Button-1>",
+                   lambda _e, did=doc["id"], var=check_var: self._toggle_via_click(did, var))
+        # Hover state
+        def on_enter(_e=None, w=row, c=hover): w.configure(fg_color=c)
+        def on_leave(_e=None, w=row, c=bg): w.configure(fg_color=c)
+        for w in (row, text_col, title_lbl, meta_lbl, right, dot):
+            w.bind("<Enter>", on_enter)
+            w.bind("<Leave>", on_leave)
+
+        self.row_widgets[doc["id"]] = {
+            "row": row, "check": check, "var": check_var,
+            "is_new": is_new, "pill": pill, "bg": bg,
+        }
+
+    def _toggle_via_click(self, doc_id: str, var: tk.BooleanVar):
+        new_val = not var.get()
+        var.set(new_val)
+        self._toggle(doc_id, new_val)
+
+    def _extract_people_short(self, doc: dict) -> str:
+        people = doc.get("people") or {}
+        names: list[str] = []
+        if isinstance(people, dict):
+            for grp in people.values():
+                if isinstance(grp, list):
+                    for p in grp:
+                        if isinstance(p, dict):
+                            n = p.get("name") or p.get("email")
+                            if n:
+                                names.append(n)
+        if not names:
+            return ""
+        if len(names) <= 3:
+            return ", ".join(names)
+        return ", ".join(names[:3]) + f"  +{len(names) - 3}"
+
+    # ---------- selection ----------
+
+    def _toggle(self, doc_id: str, checked: bool):
+        if checked:
+            self.checked.add(doc_id)
+        else:
+            self.checked.discard(doc_id)
+        w = self.row_widgets.get(doc_id)
+        if w and w["var"].get() != checked:
+            w["var"].set(checked)
+        self._update_count()
+
+    def _select_new(self):
+        for did, w in self.row_widgets.items():
+            if w["is_new"]:
+                w["var"].set(True)
+                self.checked.add(did)
+            else:
+                w["var"].set(False)
+                self.checked.discard(did)
+        self._update_count()
+
+    def _select_all(self):
+        for did, w in self.row_widgets.items():
+            w["var"].set(True)
+            self.checked.add(did)
+        self._update_count()
+
+    def _select_none(self):
+        for did, w in self.row_widgets.items():
+            w["var"].set(False)
+        self.checked.clear()
+        self._update_count()
+
+    def _update_count(self):
+        n = len(self.checked)
+        self.selected_label.configure(text=f"{n} selected")
+        self.btn_export.configure(state="normal" if n else "disabled")
+
+    # ---------- folder + log helpers ----------
+
+    def _pick_folder(self):
+        d = filedialog.askdirectory(initialdir=self.out_root.get(), title="Choose output folder")
+        if d:
+            self.out_root.set(d)
+            self.refresh()
+
+    def _open_folder(self):
+        import subprocess
+        subprocess.run(["open", self.out_root.get()])
+
+    def _toggle_log(self):
+        self.log_visible = not self.log_visible
+        if self.log_visible:
+            self.log_frame.pack(fill="x", padx=24, pady=(0, 18))
+            self.toggle_log_btn.configure(text="▾ Hide log")
+        else:
+            self.log_frame.pack_forget()
+            self.toggle_log_btn.configure(text="▸ Show log")
 
     def _log(self, msg: str):
         self.log_q.put(msg)
 
     def _drain_log(self):
+        wrote = False
         while not self.log_q.empty():
             msg = self.log_q.get_nowait()
             self.log_text.configure(state="normal")
             self.log_text.insert("end", msg + "\n")
             self.log_text.see("end")
             self.log_text.configure(state="disabled")
+            wrote = True
+        if wrote and not self.log_visible:
+            self._toggle_log()
         self.after(100, self._drain_log)
 
-    def _pick_folder(self):
-        d = filedialog.askdirectory(initialdir=self.out_root.get(), title="Choose output folder")
-        if d:
-            self.out_root.set(d)
-
-    def _open_folder(self):
-        import subprocess
-        subprocess.run(["open", self.out_root.get()])
-
-    def _set_status(self, text: str):
-        self.status_var.set(text)
+    def _set_status(self, text: str, color: str = TEXT_SECONDARY):
+        self.status_label.configure(text=text, text_color=color)
 
     def _set_busy(self, busy: bool):
         self.worker_busy = busy
-        state = "disabled" if busy else "normal"
-        self.btn_refresh.configure(state=state)
-        self.btn_export.configure(state=state)
-
-    # ---------- selection ----------
-
-    def _toggle(self, doc_id: str):
-        if doc_id in self.checked:
-            self.checked.discard(doc_id)
+        if busy:
+            self.btn_refresh.configure(state="disabled")
+            self.btn_export.configure(state="disabled")
         else:
-            self.checked.add(doc_id)
-        self._refresh_check_column(doc_id)
-        self._update_count()
+            self.btn_refresh.configure(state="normal")
+            self._update_count()
 
-    def _refresh_check_column(self, doc_id: str):
-        if not self.tree.exists(doc_id):
-            return
-        vals = list(self.tree.item(doc_id, "values"))
-        vals[0] = "☑" if doc_id in self.checked else "☐"
-        self.tree.item(doc_id, values=vals)
-
-    def _on_tree_click(self, event):
-        region = self.tree.identify_region(event.x, event.y)
-        col = self.tree.identify_column(event.x)
-        row = self.tree.identify_row(event.y)
-        if region == "cell" and col == "#1" and row:
-            self._toggle(row)
-            return "break"
-
-    def _on_space(self, event):
-        for row in self.tree.selection():
-            self._toggle(row)
-        return "break"
-
-    def _select_new(self):
-        self.checked = {d["id"] for d in self.docs if meeting_filename(d) not in self.existing}
-        self._redraw_check_column()
-        self._update_count()
-
-    def _select_all(self):
-        self.checked = {d["id"] for d in self.docs}
-        self._redraw_check_column()
-        self._update_count()
-
-    def _select_none(self):
-        self.checked = set()
-        self._redraw_check_column()
-        self._update_count()
-
-    def _redraw_check_column(self):
-        for d in self.docs:
-            self._refresh_check_column(d["id"])
-
-    def _update_count(self):
-        self.selected_count.set(f"{len(self.checked)} selected")
-
-    # ---------- refresh (load docs) ----------
+    # ---------- refresh ----------
 
     def refresh(self):
         if self.worker_busy:
             return
         self._set_busy(True)
-        self._set_status("Refreshing…")
+        self._set_status("Loading meetings…")
         threading.Thread(target=self._refresh_worker, daemon=True).start()
 
     def _refresh_worker(self):
         try:
             token, source, remaining = load_access_token()
             self.token = token
-            self._log(f"Auth OK via {source} (~{remaining // 60}min remaining)")
+            self._log(f"Authenticated via {source} (~{remaining // 60}min remaining)")
         except AuthError as e:
             self._log(f"AUTH ERROR: {e}")
             self.after(0, lambda: messagebox.showerror(
                 "Authentication required",
-                f"{e}\n\nOpen the Granola app, sign in, then click Refresh again.",
+                f"{e}\n\nOpen the Granola app, sign in, then click Refresh.",
             ))
             self.after(0, lambda: self._set_busy(False))
-            self.after(0, lambda: self._set_status("Auth required"))
+            self.after(0, lambda: self._set_status("Authentication required", DANGER))
             return
 
         try:
@@ -250,51 +475,32 @@ class App(tk.Tk):
         self.existing = existing
         new_count = sum(1 for d in docs if meeting_filename(d) not in existing)
 
-        self._log(f"Loaded {len(docs)} meetings — {new_count} new, {len(docs) - new_count} already exported")
-
-        self.after(0, lambda: self._populate_tree())
-        self.after(0, lambda: self._select_new())  # auto-tick new ones
-        self.after(0, lambda: self._set_status(f"{len(docs)} meetings ({new_count} new)"))
+        self.after(0, self._populate_list)
+        self.after(0, self._select_new)
+        self.after(0, lambda nc=new_count: self.summary_label.configure(
+            text=f"{len(docs)} meetings · {nc} new · {len(docs) - nc} exported"
+        ))
+        self.after(0, lambda nc=new_count: self._set_status(
+            f"{nc} new meeting{'s' if nc != 1 else ''} ready to export" if nc else "All caught up",
+            ACCENT if nc else TEXT_PRIMARY,
+        ))
         self.after(0, lambda: self._set_busy(False))
 
-    def _populate_tree(self):
-        self.tree.delete(*self.tree.get_children())
+    def _populate_list(self):
+        self._clear_list()
+        if not self.docs:
+            ctk.CTkLabel(
+                self.list_frame, text="No meetings found.",
+                font=f(14), text_color=TEXT_TERTIARY,
+            ).pack(pady=60)
+            return
         for d in self.docs:
-            fname = meeting_filename(d)
-            is_new = fname not in self.existing
-            dt = parse_iso(d.get("created_at"))
-            date_str = dt.astimezone().strftime("%Y-%m-%d %H:%M") if dt else "—"
-            title = d.get("title") or "Untitled"
-            people = d.get("people") or {}
-            names: list[str] = []
-            if isinstance(people, dict):
-                for grp in people.values():
-                    if isinstance(grp, list):
-                        for p in grp:
-                            if isinstance(p, dict):
-                                n = p.get("name") or p.get("email")
-                                if n:
-                                    names.append(n)
-            participants = ", ".join(names[:3])
-            if len(names) > 3:
-                participants += f" +{len(names) - 3}"
-
-            status = "🆕 NEW" if is_new else "✓ Exported"
-            tags = ("new",) if is_new else ("exported",)
-            self.tree.insert(
-                "", "end",
-                iid=d["id"],
-                values=("☐", status, date_str, title, participants or "—"),
-                tags=tags,
-            )
+            self._build_row(d)
 
     # ---------- export ----------
 
     def export(self):
-        if self.worker_busy:
-            return
-        if not self.checked:
-            messagebox.showinfo("Nothing selected", "Tick some meetings first (click the ✓ column).")
+        if self.worker_busy or not self.checked:
             return
         if not self.token:
             messagebox.showerror("Not authenticated", "Click Refresh first.")
@@ -306,18 +512,20 @@ class App(tk.Tk):
 
         to_export = [d for d in self.docs if d["id"] in self.checked]
         self._set_busy(True)
-        self.progress.configure(maximum=len(to_export), value=0)
+        self.progress.set(0)
         self._set_status(f"Exporting 0 / {len(to_export)}…")
-        threading.Thread(target=self._export_worker, args=(to_export, out_root, out_dir), daemon=True).start()
+        threading.Thread(
+            target=self._export_worker, args=(to_export, out_root, out_dir), daemon=True
+        ).start()
 
     def _export_worker(self, docs: list[dict], out_root: Path, out_dir: Path):
         fetched = no_tx = errors = 0
-        # start with existing entries so the index includes everything
         entries_by_name = {m.filename: m for m in collect_existing_meta(out_dir)}
+        total = len(docs)
 
         for i, doc in enumerate(docs, 1):
             title = doc.get("title") or "Untitled"
-            self._log(f"[{i}/{len(docs)}] {title}")
+            self._log(f"[{i}/{total}] {title}")
 
             segments = None
             try:
@@ -334,9 +542,9 @@ class App(tk.Tk):
                         fetched += 1
             except urllib.error.HTTPError as e:
                 if e.code in (401, 403):
-                    self._log("AUTH expired mid-run. Open Granola app, then Refresh + retry.")
+                    self._log("AUTH expired mid-run. Open Granola, then Refresh + retry.")
                     self.after(0, lambda: self._set_busy(False))
-                    self.after(0, lambda: self._set_status("Auth expired"))
+                    self.after(0, lambda: self._set_status("Auth expired — open Granola", DANGER))
                     return
                 errors += 1
                 self._log(f"  HTTP {e.code} for {title}")
@@ -347,14 +555,13 @@ class App(tk.Tk):
             try:
                 _, meta = write_meeting_file(out_dir, doc, segments)
                 entries_by_name[meta.filename] = meta
-                # Mark row as exported
                 self.after(0, self._mark_exported, doc["id"])
             except Exception as e:
                 self._log(f"  WRITE ERROR: {e}")
 
-            self.after(0, lambda v=i: self.progress.configure(value=v))
-            self.after(0, lambda i=i, n=len(docs): self._set_status(f"Exporting {i} / {n}…"))
-            time.sleep(0.2)
+            self.after(0, lambda v=i, n=total: self.progress.set(v / n))
+            self.after(0, lambda i=i, n=total: self._set_status(f"Exporting {i} / {n}…"))
+            time.sleep(0.15)
 
         try:
             write_index(out_root, list(entries_by_name.values()))
@@ -362,21 +569,26 @@ class App(tk.Tk):
         except Exception as e:
             self._log(f"INDEX ERROR: {e}")
 
-        self._log(f"\n✅ Done. fetched={fetched}  no_transcript={no_tx}  errors={errors}")
-        self.after(0, lambda: self._set_status(f"Done — {fetched} transcripts, {errors} errors"))
+        self._log(f"\n✅ Done — {fetched} transcripts, {no_tx} without, {errors} errors")
+        self.after(0, lambda: self.progress.set(1))
+        self.after(0, lambda: self._set_status(
+            f"Done · {fetched} transcripts · {errors} errors",
+            ACCENT if not errors else TEXT_PRIMARY,
+        ))
         self.after(0, lambda: self._set_busy(False))
-        # refresh existing set so re-runs know what's exported
         self.existing = scan_existing(out_dir)
-        self.checked = set()
+        self.checked.clear()
         self.after(0, self._update_count)
 
     def _mark_exported(self, doc_id: str):
-        if not self.tree.exists(doc_id):
+        w = self.row_widgets.get(doc_id)
+        if not w:
             return
-        vals = list(self.tree.item(doc_id, "values"))
-        vals[0] = "☐"
-        vals[1] = "✓ Exported"
-        self.tree.item(doc_id, values=vals, tags=("exported",))
+        w["row"].configure(fg_color=BG_CARD)
+        w["bg"] = BG_CARD
+        w["is_new"] = False
+        w["pill"].configure(text="EXPORTED", text_color=PILL_EXPORTED_FG, fg_color=PILL_EXPORTED_BG)
+        w["var"].set(False)
 
 
 if __name__ == "__main__":
