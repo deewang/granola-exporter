@@ -22,6 +22,7 @@ from granola_core import (
     AuthError,
     DEFAULT_OUT_ROOT,
     SUPABASE_FILE,
+    __version__ as APP_VERSION,
     collect_existing_meta,
     fetch_transcript,
     load_access_token,
@@ -316,10 +317,17 @@ class App(ctk.CTk):
         left = ctk.CTkFrame(header, fg_color="transparent")
         left.pack(side="left", fill="y")
 
+        title_row = ctk.CTkFrame(left, fg_color="transparent")
+        title_row.pack(anchor="w")
         ctk.CTkLabel(
-            left, text="Granola Export",
+            title_row, text="Granola Export",
             font=f(26, "bold", display=True), text_color=TEXT_PRIMARY,
-        ).pack(anchor="w")
+        ).pack(side="left")
+        ctk.CTkLabel(
+            title_row, text=f"v{APP_VERSION}",
+            font=f(11, "bold"), text_color=TEXT_TERTIARY,
+        ).pack(side="left", padx=(8, 0), pady=(8, 0))
+
         ctk.CTkLabel(
             left, text="Export your meetings as Markdown — sortable, indexed, AI-ready.",
             font=f(13), text_color=TEXT_SECONDARY,

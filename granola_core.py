@@ -13,6 +13,27 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+
+def _read_version() -> str:
+    """Single source of truth for the app version, read from VERSION file.
+
+    Works in both source-tree mode and PyInstaller-bundled mode (the build
+    script copies VERSION into the bundle's Resources/ directory).
+    """
+    here = Path(__file__).resolve().parent
+    candidates = [
+        here / "VERSION",
+        here.parent / "VERSION",                 # bundled: Contents/Resources/VERSION → ../
+        Path(getattr(sys, "_MEIPASS", "")) / "VERSION" if getattr(sys, "_MEIPASS", "") else None,
+    ]
+    for p in candidates:
+        if p and p.exists():
+            return p.read_text().strip() or "0.0.0"
+    return "0.0.0"
+
+
+__version__ = _read_version()
+
 GRANOLA_DIR = Path.home() / "Library/Application Support/Granola"
 SUPABASE_FILE = GRANOLA_DIR / "supabase.json"
 CACHE_FILE = GRANOLA_DIR / "cache-v6.json"

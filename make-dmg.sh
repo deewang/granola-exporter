@@ -8,7 +8,14 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 APP="dist/Granola Export.app"
-VERSION="${VERSION:-1.0}"
+# Default version comes from the VERSION file; env var overrides if set
+if [[ -z "${VERSION:-}" ]]; then
+    if [[ -f VERSION ]]; then
+        VERSION="$(tr -d '[:space:]' < VERSION)"
+    else
+        VERSION="1.0"
+    fi
+fi
 DMG_NAME="Granola-Export-${VERSION}.dmg"
 STAGING="dist/dmg-staging"
 
