@@ -12,6 +12,7 @@ import threading
 import time
 import tkinter as tk
 import urllib.error
+from datetime import datetime
 from pathlib import Path
 
 import customtkinter as ctk
@@ -83,6 +84,96 @@ FONT_FAMILY_DISPLAY = "SF Pro Display"
 
 PAGE_SIZE = 50
 
+# Avatar colours for the People view (cycled by hashing the email/name)
+AVATAR_COLORS = [
+    "#A78BFA",  # purple
+    "#F472B6",  # pink
+    "#FB923C",  # orange
+    "#FBBF24",  # amber
+    "#A3E635",  # lime
+    "#34D399",  # emerald
+    "#22D3EE",  # cyan
+    "#60A5FA",  # blue
+    "#818CF8",  # indigo
+    "#F87171",  # red
+]
+
+def avatar_color_for(seed: str) -> str:
+    if not seed:
+        return AVATAR_COLORS[0]
+    return AVATAR_COLORS[abs(hash(seed)) % len(AVATAR_COLORS)]
+
+
+def aggregate_people(docs: list[dict]) -> list[dict]:
+    """Group meetings by participant. Returns a list sorted by last-meeting-date desc.
+
+    Each entry: {name, email, domain, last_date, count, meetings}.
+    """
+    by_key: dict[str, dict] = {}
+    for doc in docs:
+        people = doc.get("people") or {}
+        if not isinstance(people, dict):
+            continue
+        for grp in people.values():
+            if not isinstance(grp, list):
+                continue
+            for p in grp:
+                if not isinstance(p, dict):
+                    continue
+                email = (p.get("email") or "").strip().lower()
+                name = (p.get("name") or "").strip()
+                if not email and not name:
+                    continue
+                key = email or name.lower()
+                bucket = by_key.setdefault(key, {
+                    "email": email, "name": name, "meetings": [],
+                })
+                # Prefer a longer/more complete name
+                if name and len(name) > len(bucket.get("name") or ""):
+                    bucket["name"] = name
+                # Prefer a real email over an empty one
+                if email and not bucket.get("email"):
+                    bucket["email"] = email
+                bucket["meetings"].append(doc)
+
+    result: list[dict] = []
+    for p in by_key.values():
+        p["meetings"].sort(key=lambda d: d.get("created_at") or "", reverse=True)
+        p["last_date"] = p["meetings"][0].get("created_at", "") if p["meetings"] else ""
+        p["count"] = len(p["meetings"])
+        # Display name: keep raw name; if it's just an email handle, title-case it
+        if not p["name"] and p["email"]:
+            p["name"] = p["email"].split("@")[0].replace(".", " ").title()
+        p["domain"] = p["email"].split("@", 1)[1] if "@" in p["email"] else ""
+        result.append(p)
+
+    result.sort(key=lambda x: x["last_date"], reverse=True)
+    return result
+
+
+def relative_date_label(iso_str: str) -> str:
+    """Return 'Today', 'Yesterday', 'Apr 24', 'Jan 14, 2025' etc."""
+    dt = None
+    if iso_str:
+        try:
+            dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        except ValueError:
+            return ""
+    if not dt:
+        return ""
+    now = datetime.now(dt.tzinfo)
+    today = now.date()
+    delta = (today - dt.astimezone().date()).days
+    if delta == 0:
+        return "Today"
+    if delta == 1:
+        return "Yesterday"
+    if delta < 7:
+        return dt.astimezone().strftime("%A")
+    if dt.year == now.year:
+        return dt.astimezone().strftime("%b %d")
+    return dt.astimezone().strftime("%b %d, %Y")
+
 SORT_OPTIONS = {
     "Date (newest first)": ("date", True),
     "Date (oldest first)": ("date", False),
@@ -134,11 +225,60 @@ class App(ctk.CTk):
 
     def _build_ui(self):
         self._build_header()
+        self._build_main_nav()
+
+        # Stacked view container — switches between Meetings and People
+        self.view_stack = ctk.CTkFrame(self, fg_color="transparent")
+        self.view_stack.pack(fill="both", expand=True)
+
+        # Meetings view (existing UI lives here)
+        self._meetings_frame = ctk.CTkFrame(self.view_stack, fg_color="transparent")
+        self._meetings_container = self._meetings_frame
         self._build_toolbar()
         self._build_summary_bar()
         self._build_meeting_list()
         self._build_pagination()
+
+        # People view
+        self._people_frame = ctk.CTkFrame(self.view_stack, fg_color="transparent")
+        self._build_people_view()
+
+        # Footer is shared across views
         self._build_footer()
+
+        # Show meetings by default
+        self._show_view("meetings")
+
+    def _build_main_nav(self):
+        nav_row = ctk.CTkFrame(self, fg_color="transparent", height=44)
+        nav_row.pack(fill="x", padx=24, pady=(0, 8))
+        nav_row.pack_propagate(False)
+
+        self.nav_segmented = ctk.CTkSegmentedButton(
+            nav_row, values=["Meetings", "People"],
+            font=f(13, "bold"),
+            fg_color=BG_PANEL, selected_color=NEUTRAL_BTN,
+            selected_hover_color=NEUTRAL_BTN_HOVER,
+            unselected_color=BG_PANEL, unselected_hover_color=GHOST_BTN_HOVER,
+            text_color=TEXT_PRIMARY, text_color_disabled=TEXT_TERTIARY,
+            corner_radius=10, height=34,
+            command=self._on_nav_change,
+        )
+        self.nav_segmented.set("Meetings")
+        self.nav_segmented.pack(side="left")
+
+    def _on_nav_change(self, choice: str):
+        self._show_view("people" if choice == "People" else "meetings")
+
+    def _show_view(self, name: str):
+        self._meetings_frame.pack_forget()
+        self._people_frame.pack_forget()
+        if name == "meetings":
+            self._meetings_frame.pack(in_=self.view_stack, fill="both", expand=True)
+        else:
+            self._people_frame.pack(in_=self.view_stack, fill="both", expand=True)
+            self._render_people_list()
+        self.current_view = name
 
     def _build_header(self):
         header = ctk.CTkFrame(self, fg_color="transparent", height=78)
@@ -169,7 +309,7 @@ class App(ctk.CTk):
         self.conn_chip.bind("<Button-1>", lambda _e: self._on_chip_click())
 
     def _build_toolbar(self):
-        bar = ctk.CTkFrame(self, fg_color=BG_PANEL, corner_radius=12,
+        bar = ctk.CTkFrame(self._meetings_container, fg_color=BG_PANEL, corner_radius=12,
                            border_width=1, border_color=BORDER)
         bar.pack(fill="x", padx=24, pady=(0, 12))
 
@@ -222,7 +362,7 @@ class App(ctk.CTk):
         ).pack(side="right", padx=(0, 8))
 
     def _build_summary_bar(self):
-        bar = ctk.CTkFrame(self, fg_color="transparent", height=52)
+        bar = ctk.CTkFrame(self._meetings_container, fg_color="transparent", height=52)
         bar.pack(fill="x", padx=28, pady=(0, 8))
         bar.pack_propagate(False)
 
@@ -298,7 +438,7 @@ class App(ctk.CTk):
             return path_str
 
     def _build_meeting_list(self):
-        wrap = ctk.CTkFrame(self, fg_color=BG_PANEL, corner_radius=12,
+        wrap = ctk.CTkFrame(self._meetings_container, fg_color=BG_PANEL, corner_radius=12,
                             border_width=1, border_color=BORDER)
         wrap.pack(fill="both", expand=True, padx=24, pady=(0, 8))
 
@@ -310,7 +450,7 @@ class App(ctk.CTk):
         self.list_frame.pack(fill="both", expand=True, padx=8, pady=8)
 
     def _build_pagination(self):
-        bar = ctk.CTkFrame(self, fg_color="transparent", height=34)
+        bar = ctk.CTkFrame(self._meetings_container, fg_color="transparent", height=34)
         bar.pack(fill="x", padx=24, pady=(0, 10))
         bar.pack_propagate(False)
 
@@ -694,6 +834,317 @@ class App(ctk.CTk):
             else:
                 self._set_chip(f"● Connected · {mins}m", CHIP_OK_FG, CHIP_OK_BG)
         self.after(5000, self._tick_token_status)
+
+    # ---------- People view ----------
+
+    def _build_people_view(self):
+        """Build the People list + Contact detail sub-views inside _people_frame."""
+        # We toggle between two sub-views:
+        #   _people_list_frame   — table of all contacts
+        #   _people_detail_frame — single contact with their meetings
+        self._people_list_frame = ctk.CTkFrame(self._people_frame, fg_color="transparent")
+        self._people_detail_frame = ctk.CTkFrame(self._people_frame, fg_color="transparent")
+        self._people_list_frame.pack(fill="both", expand=True)
+
+        # ----- list header row (column titles + search placeholder) -----
+        list_header = ctk.CTkFrame(self._people_list_frame, fg_color="transparent", height=44)
+        list_header.pack(fill="x", padx=24, pady=(8, 8))
+        list_header.pack_propagate(False)
+
+        ctk.CTkLabel(
+            list_header, text="People",
+            font=f(22, "bold", display=True), text_color=TEXT_PRIMARY,
+        ).pack(side="left")
+
+        self.people_count_label = ctk.CTkLabel(
+            list_header, text="", font=f(12), text_color=TEXT_SECONDARY,
+        )
+        self.people_count_label.pack(side="left", padx=(10, 0), pady=(8, 0))
+
+        # ----- column headers -----
+        col_headers = ctk.CTkFrame(self._people_list_frame, fg_color="transparent", height=24)
+        col_headers.pack(fill="x", padx=28, pady=(0, 4))
+        col_headers.pack_propagate(False)
+        ctk.CTkLabel(col_headers, text="Person", font=f(11, "bold"),
+                      text_color=TEXT_TERTIARY, anchor="w").pack(side="left")
+        ctk.CTkLabel(col_headers, text="Notes", font=f(11, "bold"),
+                      text_color=TEXT_TERTIARY, anchor="e", width=70).pack(side="right", padx=(0, 12))
+        ctk.CTkLabel(col_headers, text="Last note", font=f(11, "bold"),
+                      text_color=TEXT_TERTIARY, anchor="e", width=120).pack(side="right", padx=(0, 12))
+
+        # ----- scrollable people list -----
+        list_wrap = ctk.CTkFrame(self._people_list_frame, fg_color=BG_PANEL,
+                                  corner_radius=12, border_width=1, border_color=BORDER)
+        list_wrap.pack(fill="both", expand=True, padx=24, pady=(0, 16))
+
+        self.people_scroll = ctk.CTkScrollableFrame(
+            list_wrap, fg_color=BG_PANEL, corner_radius=10,
+            scrollbar_button_color=BORDER, scrollbar_button_hover_color=TEXT_TERTIARY,
+        )
+        self.people_scroll.pack(fill="both", expand=True, padx=8, pady=8)
+
+    def _render_people_list(self):
+        """Re-aggregate and render the people list."""
+        people = aggregate_people(self.docs) if self.docs else []
+        self.people_count_label.configure(text=f"· {len(people)} contact{'s' if len(people) != 1 else ''}")
+
+        # Clear
+        for w in list(self.people_scroll.winfo_children()):
+            w.destroy()
+
+        if not people:
+            ctk.CTkLabel(
+                self.people_scroll, text="No people detected yet — click Refresh on the Meetings tab first.",
+                font=f(13), text_color=TEXT_TERTIARY,
+            ).pack(pady=60)
+            return
+
+        for person in people:
+            self._build_person_row(person)
+
+    def _build_person_row(self, person: dict):
+        row = ctk.CTkFrame(self.people_scroll, fg_color=BG_CARD, corner_radius=8, height=58)
+        row.pack(fill="x", padx=4, pady=2)
+        row.pack_propagate(False)
+
+        # Avatar circle
+        seed = person.get("email") or person.get("name") or "?"
+        initial = (person.get("name") or person.get("email") or "?")[:1].upper()
+        avatar = ctk.CTkLabel(
+            row, text=initial, width=36, height=36, corner_radius=18,
+            fg_color=avatar_color_for(seed), text_color="#FFFFFF",
+            font=f(13, "bold"),
+        )
+        avatar.pack(side="left", padx=(14, 12), pady=11)
+
+        # Name + email column
+        text_col = ctk.CTkFrame(row, fg_color="transparent")
+        text_col.pack(side="left", fill="both", expand=True)
+
+        name = person.get("name") or "—"
+        ctk.CTkLabel(
+            text_col, text=name, font=f(13, "bold"),
+            text_color=TEXT_PRIMARY, anchor="w",
+        ).pack(anchor="w", pady=(10, 0))
+
+        email = person.get("email") or ""
+        ctk.CTkLabel(
+            text_col, text=email or "(no email)",
+            font=f(11), text_color=TEXT_SECONDARY, anchor="w",
+        ).pack(anchor="w")
+
+        # Notes count (right side)
+        ctk.CTkLabel(
+            row, text=str(person["count"]), font=f(13, "bold"),
+            text_color=TEXT_PRIMARY, width=70, anchor="e",
+        ).pack(side="right", padx=(0, 16))
+
+        # Last-note date
+        ctk.CTkLabel(
+            row, text=relative_date_label(person.get("last_date", "")) or "—",
+            font=f(12), text_color=TEXT_SECONDARY, width=120, anchor="e",
+        ).pack(side="right", padx=(0, 12))
+
+        # Hover + click
+        hover = BG_CARD_HOVER
+        bg = BG_CARD
+        def on_enter(_e=None, w=row): w.configure(fg_color=hover)
+        def on_leave(_e=None, w=row): w.configure(fg_color=bg)
+        row.bind("<Enter>", on_enter)
+        row.bind("<Leave>", on_leave)
+
+        for w in (row, avatar, text_col):
+            w.bind("<Button-1>", lambda _e, p=person: self._open_contact_detail(p))
+            try:
+                w.configure(cursor="hand2")
+            except tk.TclError:
+                pass
+        # Children of text_col also need the click binding
+        for child in text_col.winfo_children():
+            child.bind("<Button-1>", lambda _e, p=person: self._open_contact_detail(p))
+            try:
+                child.configure(cursor="hand2")
+            except tk.TclError:
+                pass
+
+    # ---------- Contact detail sub-view ----------
+
+    def _open_contact_detail(self, person: dict):
+        self._people_list_frame.pack_forget()
+        # Rebuild detail frame fresh each time so we don't leak widgets
+        for w in list(self._people_detail_frame.winfo_children()):
+            w.destroy()
+        self._render_contact_detail(person)
+        self._people_detail_frame.pack(in_=self._people_frame, fill="both", expand=True)
+
+    def _back_to_people_list(self):
+        self._people_detail_frame.pack_forget()
+        self._people_list_frame.pack(in_=self._people_frame, fill="both", expand=True)
+
+    def _render_contact_detail(self, person: dict):
+        # Top bar: back button
+        topbar = ctk.CTkFrame(self._people_detail_frame, fg_color="transparent", height=40)
+        topbar.pack(fill="x", padx=24, pady=(8, 8))
+        topbar.pack_propagate(False)
+        ctk.CTkButton(
+            topbar, text="‹  People", font=f(12),
+            fg_color=GHOST_BTN, hover_color=GHOST_BTN_HOVER,
+            text_color=GHOST_BTN_TEXT,
+            border_color=GHOST_BTN_BORDER, border_width=1,
+            corner_radius=8, height=30, width=110,
+            command=self._back_to_people_list,
+        ).pack(side="left")
+
+        # Contact header (avatar + name + email + domain)
+        header = ctk.CTkFrame(self._people_detail_frame, fg_color="transparent")
+        header.pack(fill="x", padx=24, pady=(8, 12))
+
+        seed = person.get("email") or person.get("name") or "?"
+        initial = (person.get("name") or person.get("email") or "?")[:1].upper()
+        ctk.CTkLabel(
+            header, text=initial, width=56, height=56, corner_radius=28,
+            fg_color=avatar_color_for(seed), text_color="#FFFFFF",
+            font=f(20, "bold", display=True),
+        ).pack(side="left", padx=(0, 16))
+
+        info = ctk.CTkFrame(header, fg_color="transparent")
+        info.pack(side="left", fill="y")
+        ctk.CTkLabel(
+            info, text=person.get("name") or "—",
+            font=f(22, "bold", display=True), text_color=TEXT_PRIMARY, anchor="w",
+        ).pack(anchor="w")
+
+        meta = []
+        if person.get("email"):
+            meta.append(person["email"])
+        if person.get("domain"):
+            meta.append(person["domain"])
+        ctk.CTkLabel(
+            info, text="  ·  ".join(meta) or "—",
+            font=f(12), text_color=TEXT_SECONDARY, anchor="w",
+        ).pack(anchor="w", pady=(2, 0))
+
+        # AI search box (placeholder — non-functional)
+        ai_wrap = ctk.CTkFrame(self._people_detail_frame, fg_color=BG_PANEL,
+                                corner_radius=12, border_width=1, border_color=BORDER, height=54)
+        ai_wrap.pack(fill="x", padx=24, pady=(0, 10))
+        ai_wrap.pack_propagate(False)
+        ctk.CTkLabel(
+            ai_wrap, text="✨", font=f(16), text_color=TEXT_SECONDARY,
+        ).pack(side="left", padx=(14, 8))
+        ctk.CTkEntry(
+            ai_wrap, font=f(13),
+            placeholder_text=f"Ask anything about {person.get('name') or 'this person'}…  (coming soon)",
+            fg_color=BG_PANEL, border_width=0, text_color=TEXT_PRIMARY,
+            placeholder_text_color=TEXT_TERTIARY, height=32,
+        ).pack(side="left", fill="x", expand=True, padx=(0, 14))
+        ctk.CTkLabel(
+            ai_wrap, text="Sonnet 4.6 ▾", font=f(11),
+            text_color=TEXT_TERTIARY,
+        ).pack(side="right", padx=(0, 14))
+
+        # Quick action chips (placeholder)
+        chips_row = ctk.CTkFrame(self._people_detail_frame, fg_color="transparent")
+        chips_row.pack(fill="x", padx=24, pady=(0, 16))
+        for label in ("Prep next meeting", "List outstanding items", "Coach me on next call"):
+            ctk.CTkButton(
+                chips_row, text=f"›  {label}", font=f(12),
+                fg_color=GHOST_BTN, hover_color=GHOST_BTN_HOVER,
+                text_color=TEXT_SECONDARY,
+                border_color=GHOST_BTN_BORDER, border_width=1,
+                corner_radius=20, height=28, width=10,
+                command=lambda l=label: self._log(f"[ai-placeholder] {l}: not implemented yet"),
+            ).pack(side="left", padx=(0, 8))
+
+        # Notes timeline header
+        notes_header = ctk.CTkFrame(self._people_detail_frame, fg_color="transparent", height=32)
+        notes_header.pack(fill="x", padx=24, pady=(4, 4))
+        notes_header.pack_propagate(False)
+        ctk.CTkLabel(
+            notes_header, text=f"All notes  ·  {person['count']}",
+            font=f(13, "bold"), text_color=TEXT_PRIMARY, anchor="w",
+        ).pack(side="left")
+
+        # Scrollable list of meetings with this person, grouped by date
+        notes_wrap = ctk.CTkFrame(self._people_detail_frame, fg_color=BG_PANEL,
+                                   corner_radius=12, border_width=1, border_color=BORDER)
+        notes_wrap.pack(fill="both", expand=True, padx=24, pady=(0, 16))
+
+        notes_scroll = ctk.CTkScrollableFrame(
+            notes_wrap, fg_color=BG_PANEL, corner_radius=10,
+            scrollbar_button_color=BORDER, scrollbar_button_hover_color=TEXT_TERTIARY,
+        )
+        notes_scroll.pack(fill="both", expand=True, padx=8, pady=8)
+
+        # Group meetings under date headers
+        last_group = None
+        for doc in person["meetings"]:
+            group = relative_date_label(doc.get("created_at", "")) or "Earlier"
+            if group != last_group:
+                ctk.CTkLabel(
+                    notes_scroll, text=group, font=f(11, "bold"),
+                    text_color=TEXT_TERTIARY, anchor="w",
+                ).pack(anchor="w", padx=10, pady=(10, 4))
+                last_group = group
+            self._build_contact_note_row(notes_scroll, doc, person)
+
+    def _build_contact_note_row(self, parent, doc: dict, person: dict):
+        is_new = meeting_filename(doc) not in self.existing
+        bg = BG_CARD_NEW if is_new else BG_CARD
+        hover = BG_CARD_NEW_HOVER if is_new else BG_CARD_HOVER
+
+        row = ctk.CTkFrame(parent, fg_color=bg, corner_radius=8, height=52)
+        row.pack(fill="x", padx=4, pady=2)
+        row.pack_propagate(False)
+
+        # Avatar circle on left (same as main person)
+        seed = person.get("email") or person.get("name") or "?"
+        initial = (person.get("name") or person.get("email") or "?")[:1].upper()
+        ctk.CTkLabel(
+            row, text=initial, width=30, height=30, corner_radius=15,
+            fg_color=avatar_color_for(seed), text_color="#FFFFFF",
+            font=f(11, "bold"),
+        ).pack(side="left", padx=(14, 10), pady=11)
+
+        # Title + sub label
+        text_col = ctk.CTkFrame(row, fg_color="transparent")
+        text_col.pack(side="left", fill="both", expand=True)
+        title = doc.get("title") or "Untitled"
+        ctk.CTkLabel(
+            text_col, text=title, font=f(13, "bold"),
+            text_color=TEXT_PRIMARY, anchor="w",
+        ).pack(anchor="w", pady=(8, 0))
+        ctk.CTkLabel(
+            text_col, text=person.get("name") or person.get("email") or "—",
+            font=f(11), text_color=TEXT_SECONDARY, anchor="w",
+        ).pack(anchor="w")
+
+        # Time on right
+        dt = parse_iso(doc.get("created_at"))
+        time_str = dt.astimezone().strftime("%-I:%M %p").lower() if dt else "—"
+        ctk.CTkLabel(
+            row, text=time_str, font=f(11), text_color=TEXT_TERTIARY,
+            anchor="e", width=80,
+        ).pack(side="right", padx=(0, 16))
+
+        def on_enter(_e=None, w=row): w.configure(fg_color=hover)
+        def on_leave(_e=None, w=row): w.configure(fg_color=bg)
+        row.bind("<Enter>", on_enter)
+        row.bind("<Leave>", on_leave)
+
+        # Click → open existing meeting detail window
+        for w in (row, text_col):
+            w.bind("<Button-1>", lambda _e, d=doc: self._open_detail(d))
+            try:
+                w.configure(cursor="hand2")
+            except tk.TclError:
+                pass
+        for child in text_col.winfo_children():
+            child.bind("<Button-1>", lambda _e, d=doc: self._open_detail(d))
+            try:
+                child.configure(cursor="hand2")
+            except tk.TclError:
+                pass
 
     def _show_data_info(self):
         """Modal explaining where the meeting list + transcripts come from."""
