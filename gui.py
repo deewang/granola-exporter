@@ -8,6 +8,7 @@ Workflow:
 """
 
 import queue
+import subprocess
 import threading
 import time
 import tkinter as tk
@@ -37,6 +38,7 @@ from granola_core import (
     write_index,
     write_meeting_file,
 )
+from menubar import MenuBarController
 
 # ---------- design tokens (Granola-inspired warm light theme) ----------
 
@@ -224,6 +226,18 @@ class App(ctk.CTk):
 
         # Auto-scan state
         self._auto_scan_after_id: str | None = None
+
+        # macOS menu-bar status item (top of screen) — no-op if PyObjC missing
+        self.menubar = MenuBarController(
+            title_text="📓",
+            menu_callbacks={
+                "show_window": self._mb_show_window,
+                "scan_now":    self._mb_scan_now,
+                "open_folder": self._mb_open_folder,
+                "quit":        self._mb_quit,
+            },
+            notification_callback=self._mb_notification_clicked,
+        )
 
         # People-view state
         self.people_cache: list[dict] = []        # last aggregation
@@ -1302,6 +1316,65 @@ class App(ctk.CTk):
             except tk.TclError:
                 pass
 
+    # ---------- Menu-bar callbacks ----------
+
+    def _mb_show_window(self):
+        """Bring the app window to the foreground from the menu-bar item."""
+        try:
+            self.deiconify()         # in case it's minimised
+            self.lift()
+            self.focus_force()
+            # On macOS we also need to call NSRunningApplication activate
+            self._activate_app()
+        except Exception as e:
+            self._log(f"menubar: show_window failed: {e}")
+
+    def _mb_open_folder(self):
+        """Open the output folder in Finder."""
+        try:
+            subprocess.run(["open", self.out_root.get()])
+        except Exception as e:
+            self._log(f"menubar: open_folder failed: {e}")
+
+    def _mb_scan_now(self):
+        """Trigger an immediate auto-scan from the menu-bar."""
+        self._kick_auto_scan(manual=True)
+
+    def _mb_quit(self):
+        """Quit the entire app from the menu-bar."""
+        try:
+            self.destroy()
+        except Exception:
+            pass
+
+    def _mb_notification_clicked(self, payload: dict):
+        """Fired when the user clicks any of our notifications.
+
+        Always brings the window forward + opens the output folder if the
+        notification specified that action.
+        """
+        # Need to bounce to the Tk main thread
+        self.after(0, self._mb_show_window)
+        action = (payload or {}).get("action_key", "")
+        if action == "open_folder":
+            self.after(0, self._mb_open_folder)
+
+    def _activate_app(self):
+        """Bring our process to the foreground on macOS."""
+        try:
+            from AppKit import NSApplication
+            NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+        except Exception:
+            # Fall back to AppleScript activation by bundle id
+            try:
+                subprocess.run(
+                    ["osascript", "-e",
+                     'tell application id "com.davidwang.granolaexport" to activate'],
+                    check=False, capture_output=True, timeout=2,
+                )
+            except Exception:
+                pass
+
     # ---------- Settings dialog + auto-scan ----------
 
     AUTO_SCAN_INTERVAL_OPTIONS = {
@@ -1497,8 +1570,16 @@ class App(ctk.CTk):
         ).start()
 
     def _auto_scan_worker(self, manual: bool):
+        # Notify "scan started"
+        if self.prefs.notify_on_new:
+            self.menubar.notify(
+                title="Granola Export",
+                message="Checking Granola for new meetings…",
+            )
+        self.menubar.set_title("📓⟳")  # spinning hint while scanning
+
         try:
-            # 1) Get fresh token (may have expired since last refresh)
+            # 1) Get fresh token
             try:
                 token, source, remaining = load_access_token()
                 self.token = token
@@ -1525,6 +1606,12 @@ class App(ctk.CTk):
                 self.prefs.last_scan_new_count = 0
                 self.prefs.last_scan_fetched_count = 0
                 save_preferences(self.prefs)
+                # Notify "scan complete (no new)"
+                if self.prefs.notify_on_new:
+                    self.menubar.notify(
+                        title="Granola Export",
+                        message="Scan complete — no new meetings.",
+                    )
                 return
 
             # 3) Fetch + write each new meeting
@@ -1581,11 +1668,16 @@ class App(ctk.CTk):
             self.prefs.last_scan_fetched_count = fetched
             save_preferences(self.prefs)
 
-            # 5) macOS notification + UI refresh
-            if self.prefs.notify_on_new and len(new_docs) > 0:
-                msg = (f"{len(new_docs)} new meeting{'s' if len(new_docs) != 1 else ''} exported"
-                       + (f" — {fetched} with transcripts" if fetched else ""))
-                notify_macos(title="Granola Export", message=msg)
+            # 5) Notify "new meetings detected" — clickable, opens folder
+            if self.prefs.notify_on_new:
+                singular = len(new_docs) == 1
+                phrase = "a new meeting has" if singular else f"{len(new_docs)} new meetings have"
+                self.menubar.notify(
+                    title="Granola Export",
+                    message=f"Hey, {phrase} been detected, and the transcription has been exported to your computer.",
+                    subtitle=f"{fetched} with transcripts" if fetched else "Notes only",
+                    action_key="open_folder",
+                )
 
             # Refresh the visible list so new pills flip + counts update
             self.after(0, self.refresh)
@@ -1593,12 +1685,9 @@ class App(ctk.CTk):
         except Exception as e:
             self._log(f"Auto-scan unexpected error: {type(e).__name__}: {e}")
         finally:
-            # Schedule the next one, unless this was a manual click
-            if not manual:
-                self.after(0, self._reschedule_auto_scan)
-            else:
-                # Manual run: still re-arm if enabled, but reset timer to a full interval
-                self.after(0, self._reschedule_auto_scan)
+            self.menubar.set_title("📓")  # restore idle icon
+            # Schedule the next interval (whether this was manual or timed)
+            self.after(0, self._reschedule_auto_scan)
 
     def _show_data_info(self):
         """Modal explaining where the meeting list + transcripts come from."""

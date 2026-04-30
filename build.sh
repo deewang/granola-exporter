@@ -45,7 +45,13 @@ python3 -m PyInstaller \
     --clean \
     --osx-bundle-identifier com.davidwang.granolaexport \
     --hidden-import granola_core \
+    --hidden-import menubar \
+    --hidden-import AppKit \
+    --hidden-import Foundation \
+    --hidden-import objc \
     --collect-all customtkinter \
+    --collect-submodules AppKit \
+    --collect-submodules Foundation \
     --add-data "VERSION:." \
     $ICON_FLAG \
     gui.py
