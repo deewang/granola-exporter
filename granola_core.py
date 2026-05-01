@@ -30,6 +30,9 @@ class Preferences:
     last_scan_new_count: int = 0
     last_scan_fetched_count: int = 0
     output_folder: str = ""                        # empty → use DEFAULT_OUT_ROOT
+    # Auth-status tracking (used to fire one-shot notification on transition)
+    # Values: "unknown" | "ok" | "expired"
+    last_scan_auth_status: str = "unknown"
 
 
 def load_preferences() -> "Preferences":
@@ -179,6 +182,30 @@ def is_launch_agent_installed() -> bool:
     return LAUNCH_AGENT_PATH.exists()
 
 
+# ---------- auth-status transition helper ----------
+
+def maybe_notify_auth_expired(prefs: "Preferences") -> bool:
+    """Fire a 'session expired' notification only when the auth status
+    transitions from 'ok' (or the very first time) to 'expired'.
+
+    Returns True if a notification was fired. Mutates prefs.
+    """
+    fire = prefs.last_scan_auth_status != "expired"
+    prefs.last_scan_auth_status = "expired"
+    if fire:
+        notify_macos(
+            title="Granola Export",
+            message="Your Granola session has expired. Open the Granola app to sign in again, then auto-scan will resume.",
+            subtitle="Auto-scan paused",
+        )
+    return fire
+
+
+def mark_auth_ok(prefs: "Preferences") -> None:
+    """Call after a successful authenticated operation."""
+    prefs.last_scan_auth_status = "ok"
+
+
 # ---------- headless scan (called from daemon via --scan-once) ----------
 
 def run_scan_once() -> int:
@@ -199,16 +226,20 @@ def run_scan_once() -> int:
     except Exception:
         return -1
 
-    # 1) Auth — silently skip if expired
+    # 1) Auth — fire a one-shot notification on first failure
     try:
         token, _, _ = load_access_token()
+        mark_auth_ok(prefs)
     except AuthError:
+        maybe_notify_auth_expired(prefs)
+        save_preferences(prefs)
         return -1
 
     # 2) Cache
     try:
         docs = load_documents()
     except Exception:
+        save_preferences(prefs)
         return -1
 
     existing = scan_existing(out_dir)
@@ -243,7 +274,8 @@ def run_scan_once() -> int:
                         break
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
-                # Token expired mid-scan — bail
+                # Token expired mid-scan — fire transition notification + bail
+                maybe_notify_auth_expired(prefs)
                 save_preferences(prefs)
                 return -1
             errors += 1

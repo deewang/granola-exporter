@@ -32,6 +32,8 @@ from granola_core import (
     load_access_token,
     load_documents,
     load_preferences,
+    mark_auth_ok,
+    maybe_notify_auth_expired,
     meeting_filename,
     notify_macos,
     parse_iso,
@@ -1634,8 +1636,14 @@ class App(ctk.CTk):
                 token, source, remaining = load_access_token()
                 self.token = token
                 self.token_remaining = remaining
+                mark_auth_ok(self.prefs)
+                save_preferences(self.prefs)
             except AuthError:
                 self._log("Auto-scan: skipping — no valid Granola session")
+                fired = maybe_notify_auth_expired(self.prefs)
+                save_preferences(self.prefs)
+                if fired:
+                    self._log("  → notification sent (session expired)")
                 return
 
             # 2) Reload meeting list
@@ -1687,6 +1695,10 @@ class App(ctk.CTk):
                 except urllib.error.HTTPError as e:
                     if e.code in (401, 403):
                         self._log("Auto-scan: token expired mid-scan — stopping")
+                        fired = maybe_notify_auth_expired(self.prefs)
+                        save_preferences(self.prefs)
+                        if fired:
+                            self._log("  → notification sent (session expired)")
                         return
                     errors += 1
                     self._log(f"  Auto-scan HTTP {e.code} for {title}")
@@ -1957,6 +1969,9 @@ class App(ctk.CTk):
                 self.after(0, lambda r=remaining: self._set_chip(
                     f"● Connected · {r // 60}m", CHIP_OK_FG, CHIP_OK_BG,
                 ))
+                # Reset auth-expired throttle so next failure can fire a fresh notification
+                mark_auth_ok(self.prefs)
+                save_preferences(self.prefs)
             except AuthError as e:
                 self._log(f"AUTH ERROR: {e}")
                 self.token = None
