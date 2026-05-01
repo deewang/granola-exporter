@@ -27,6 +27,8 @@ from granola_core import (
     __version__ as APP_VERSION,
     collect_existing_meta,
     fetch_transcript,
+    install_launch_agent,
+    is_launch_agent_installed,
     load_access_token,
     load_documents,
     load_preferences,
@@ -35,6 +37,7 @@ from granola_core import (
     parse_iso,
     save_preferences,
     scan_existing,
+    uninstall_launch_agent,
     write_index,
     write_meeting_file,
 )
@@ -1460,11 +1463,32 @@ class App(ctk.CTk):
         # Notify row
         self._settings_notify_var = tk.BooleanVar(value=self.prefs.notify_on_new)
         ctk.CTkSwitch(
-            sec, text="Show macOS notification when new meetings are exported",
+            sec, text="Show macOS notifications for scan events",
             variable=self._settings_notify_var,
             font=f(13), text_color=TEXT_PRIMARY,
             progress_color=ACCENT,
-        ).pack(anchor="w", padx=18, pady=(0, 14))
+        ).pack(anchor="w", padx=18, pady=(0, 8))
+
+        # Background-mode (launchd) toggle + status
+        self._settings_bg_var = tk.BooleanVar(value=self.prefs.background_scan_enabled)
+        ctk.CTkSwitch(
+            sec, text="Also run when the app is closed (background daemon)",
+            variable=self._settings_bg_var,
+            font=f(13), text_color=TEXT_PRIMARY,
+            progress_color=ACCENT,
+        ).pack(anchor="w", padx=18, pady=(0, 4))
+
+        # Inline status of the launch agent
+        bg_status_text = (
+            "✓ Background daemon is currently active (via macOS launchd)"
+            if is_launch_agent_installed() else
+            "Background daemon is not installed"
+        )
+        bg_status_color = ACCENT if is_launch_agent_installed() else TEXT_TERTIARY
+        self._settings_bg_status = ctk.CTkLabel(
+            sec, text=bg_status_text, font=f(11), text_color=bg_status_color,
+        )
+        self._settings_bg_status.pack(anchor="w", padx=18, pady=(0, 14))
 
         # Section: Last scan info + manual trigger
         info_sec = ctk.CTkFrame(win, fg_color=BG_PANEL, corner_radius=12,
@@ -1529,10 +1553,36 @@ class App(ctk.CTk):
         self.prefs.auto_scan_enabled = self._settings_auto_scan_var.get()
         self.prefs.notify_on_new = self._settings_notify_var.get()
         label = self._settings_interval_var.get()
-        self.prefs.auto_scan_interval_minutes = self.AUTO_SCAN_INTERVAL_OPTIONS.get(label, 120)
+        new_interval = self.AUTO_SCAN_INTERVAL_OPTIONS.get(label, 120)
+        interval_changed = new_interval != self.prefs.auto_scan_interval_minutes
+        self.prefs.auto_scan_interval_minutes = new_interval
+
+        bg_wanted = bool(self._settings_bg_var.get())
+        self.prefs.background_scan_enabled = bg_wanted
+
         save_preferences(self.prefs)
+
+        # Sync the launch agent state
+        if bg_wanted and self.prefs.auto_scan_enabled:
+            ok, msg = install_launch_agent(self.prefs.auto_scan_interval_minutes)
+            self._log(f"Background daemon: {msg}")
+            if not ok:
+                messagebox.showerror("Couldn't install background daemon", msg)
+        elif not bg_wanted and is_launch_agent_installed():
+            ok, msg = uninstall_launch_agent()
+            self._log(f"Background daemon: {msg}")
+        elif bg_wanted and not self.prefs.auto_scan_enabled:
+            # User asked for background but turned auto-scan off — uninstall
+            uninstall_launch_agent()
+            self._log("Background daemon uninstalled (auto-scan is off)")
+        elif interval_changed and is_launch_agent_installed():
+            # Interval changed while bg already installed — reinstall with new interval
+            install_launch_agent(self.prefs.auto_scan_interval_minutes)
+            self._log(f"Background daemon reloaded with new interval ({new_interval} min)")
+
         self._log(f"Settings saved (auto-scan={'on' if self.prefs.auto_scan_enabled else 'off'}, "
-                  f"every {self.prefs.auto_scan_interval_minutes}min)")
+                  f"every {self.prefs.auto_scan_interval_minutes}min, "
+                  f"background={'on' if bg_wanted else 'off'})")
         self._reschedule_auto_scan()
         if self._settings_win.winfo_exists():
             self._settings_win.destroy()
@@ -2496,4 +2546,8 @@ class MeetingDetailWindow(ctk.CTkToplevel):
 
 
 if __name__ == "__main__":
+    import sys as _sys
+    if "--scan-once" in _sys.argv:
+        from granola_core import run_scan_once
+        _sys.exit(0 if run_scan_once() >= 0 else 1)
     App().mainloop()

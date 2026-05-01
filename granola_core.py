@@ -22,8 +22,9 @@ PREFS_FILE = PREFS_DIR / "preferences.json"
 
 @dataclass
 class Preferences:
-    auto_scan_enabled: bool = False
-    auto_scan_interval_minutes: int = 120          # 2 hours
+    auto_scan_enabled: bool = False                # in-process scan while app is open
+    background_scan_enabled: bool = False          # launchd-driven scan even when app closed
+    auto_scan_interval_minutes: int = 120          # 2 hours (used for both modes)
     notify_on_new: bool = True
     last_scan_iso: str = ""
     last_scan_new_count: int = 0
@@ -72,6 +73,208 @@ def notify_macos(title: str, message: str, subtitle: str = "") -> bool:
         return True
     except Exception:
         return False
+
+
+# ---------- launchd background-scan agent ----------
+
+LAUNCH_AGENT_LABEL = "com.davidwang.granolaexport.scanner"
+LAUNCH_AGENT_PATH = Path.home() / "Library/LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist"
+DAEMON_LOG_PATH = Path.home() / "Library/Logs/GranolaExport-daemon.log"
+
+
+def find_app_executable() -> Optional[Path]:
+    """Find the bundled .app's main executable so launchd can call it.
+
+    Order: current sys.executable (when running bundled), /Applications,
+    ~/Applications.
+    """
+    candidates: list[Path] = []
+    if getattr(sys, "frozen", False) and sys.executable:
+        candidates.append(Path(sys.executable))
+    candidates.extend([
+        Path("/Applications/Granola Export.app/Contents/MacOS/Granola Export"),
+        Path.home() / "Applications/Granola Export.app/Contents/MacOS/Granola Export",
+    ])
+    for p in candidates:
+        if p.exists():
+            return p
+    return None
+
+
+def write_launch_agent_plist(executable: Path, interval_minutes: int) -> None:
+    """Write the LaunchAgent plist that runs `<exe> --scan-once` on a schedule."""
+    seconds = max(60, interval_minutes * 60)
+    content = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{LAUNCH_AGENT_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{executable}</string>
+        <string>--scan-once</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>{seconds}</integer>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>{DAEMON_LOG_PATH}</string>
+    <key>StandardErrorPath</key>
+    <string>{DAEMON_LOG_PATH}</string>
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
+"""
+    LAUNCH_AGENT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    DAEMON_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    LAUNCH_AGENT_PATH.write_text(content)
+
+
+def install_launch_agent(interval_minutes: int) -> tuple[bool, str]:
+    """Write the plist and load it via launchctl. Returns (ok, message)."""
+    import subprocess
+    exe = find_app_executable()
+    if not exe:
+        return False, "Couldn't find Granola Export.app — install it to /Applications first."
+    try:
+        write_launch_agent_plist(exe, interval_minutes)
+    except Exception as e:
+        return False, f"Couldn't write LaunchAgent plist: {e}"
+
+    uid = os.getuid()
+    domain = f"gui/{uid}"
+    # Unload existing first (idempotent)
+    subprocess.run(
+        ["launchctl", "bootout", domain, str(LAUNCH_AGENT_PATH)],
+        capture_output=True,
+    )
+    result = subprocess.run(
+        ["launchctl", "bootstrap", domain, str(LAUNCH_AGENT_PATH)],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return False, f"launchctl bootstrap failed: {result.stderr.strip() or result.stdout.strip()}"
+    return True, f"Background scan installed — every {interval_minutes} min"
+
+
+def uninstall_launch_agent() -> tuple[bool, str]:
+    import subprocess
+    if LAUNCH_AGENT_PATH.exists():
+        uid = os.getuid()
+        subprocess.run(
+            ["launchctl", "bootout", f"gui/{uid}", str(LAUNCH_AGENT_PATH)],
+            capture_output=True,
+        )
+        try:
+            LAUNCH_AGENT_PATH.unlink()
+        except Exception as e:
+            return False, f"Removed from launchd but couldn't delete plist: {e}"
+    return True, "Background scan removed"
+
+
+def is_launch_agent_installed() -> bool:
+    return LAUNCH_AGENT_PATH.exists()
+
+
+# ---------- headless scan (called from daemon via --scan-once) ----------
+
+def run_scan_once() -> int:
+    """Run a single scan + export pass, no UI, no event loop.
+
+    Returns the number of newly-exported meetings (0 if nothing new, -1 on
+    auth/cache failure). Sends a macOS notification for any new meetings.
+    """
+    prefs = load_preferences()
+    if not prefs.auto_scan_enabled:
+        # User disabled scanning entirely — daemon should be a no-op.
+        return 0
+
+    out_root = Path(prefs.output_folder) if prefs.output_folder else DEFAULT_OUT_ROOT
+    out_dir = out_root / "transcripts"
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return -1
+
+    # 1) Auth — silently skip if expired
+    try:
+        token, _, _ = load_access_token()
+    except AuthError:
+        return -1
+
+    # 2) Cache
+    try:
+        docs = load_documents()
+    except Exception:
+        return -1
+
+    existing = scan_existing(out_dir)
+    new_docs = [d for d in docs if meeting_filename(d) not in existing]
+
+    # Persist last-scan timestamp regardless of result
+    prefs.last_scan_iso = datetime.now().isoformat(timespec="seconds")
+
+    if not new_docs:
+        prefs.last_scan_new_count = 0
+        prefs.last_scan_fetched_count = 0
+        save_preferences(prefs)
+        return 0
+
+    # 3) Fetch + write
+    entries_by_name = {m.filename: m for m in collect_existing_meta(out_dir)}
+    fetched = errors = 0
+    for doc in new_docs:
+        segments = None
+        try:
+            resp = fetch_transcript(doc["id"], token)
+            if isinstance(resp, list):
+                segments = resp
+                if segments:
+                    fetched += 1
+            elif isinstance(resp, dict):
+                for k in ("transcript", "segments", "data"):
+                    if isinstance(resp.get(k), list):
+                        segments = resp[k]
+                        if segments:
+                            fetched += 1
+                        break
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                # Token expired mid-scan — bail
+                save_preferences(prefs)
+                return -1
+            errors += 1
+            continue
+        except Exception:
+            errors += 1
+            continue
+        try:
+            _, meta = write_meeting_file(out_dir, doc, segments)
+            entries_by_name[meta.filename] = meta
+        except Exception:
+            errors += 1
+
+    try:
+        write_index(out_root, list(entries_by_name.values()))
+    except Exception:
+        pass
+
+    prefs.last_scan_new_count = len(new_docs)
+    prefs.last_scan_fetched_count = fetched
+    save_preferences(prefs)
+
+    if prefs.notify_on_new:
+        n = len(new_docs)
+        phrase = "a new meeting has" if n == 1 else f"{n} new meetings have"
+        notify_macos(
+            title="Granola Export",
+            message=f"Hey, {phrase} been detected, and the transcription has been exported to your computer.",
+            subtitle=f"{fetched} with transcripts" if fetched else "Notes only",
+        )
+    return len(new_docs)
 
 
 def _read_version() -> str:
