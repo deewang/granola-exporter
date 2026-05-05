@@ -33,6 +33,9 @@ class Preferences:
     # Auth-status tracking (used to fire one-shot notification on transition)
     # Values: "unknown" | "ok" | "expired"
     last_scan_auth_status: str = "unknown"
+    # Whether the user has already seen the "we're now in the menu bar" hint
+    # the first time they close the window with the red dot.
+    shown_close_hint: bool = False
 
 
 def load_preferences() -> "Preferences":

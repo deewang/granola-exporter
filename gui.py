@@ -254,6 +254,15 @@ class App(ctk.CTk):
         self._auth_watch_after_id = None
 
         self._build_ui()
+
+        # Red close-button → hide window, keep menu-bar item alive.
+        # If PyObjC isn't installed (no menu bar) we let the close button quit
+        # the app normally — otherwise the user would have no way to get back.
+        if self.menubar.available:
+            self.protocol("WM_DELETE_WINDOW", self._on_close_window)
+        # Cmd+Q always fully quits.
+        self.bind_all("<Command-q>", lambda _e: self._mb_quit())
+
         self.after(100, self._drain_log)
         self.after(100, self._tick_token_status)
         self.after(200, self.refresh)
@@ -1323,10 +1332,29 @@ class App(ctk.CTk):
 
     # ---------- Menu-bar callbacks ----------
 
+    def _on_close_window(self):
+        """Red close button: hide the window but keep us alive in the menu bar."""
+        try:
+            self.withdraw()
+        except Exception as e:
+            self._log(f"close: withdraw failed: {e}")
+            self.destroy()
+            return
+
+        # First-time hint so the user knows we're still running
+        if not self.prefs.shown_close_hint:
+            self.menubar.notify(
+                title="Granola Export is still running",
+                message="Click the 📓 icon in your menu bar to reopen, or use Quit from there to fully exit.",
+                action_key="show_window",
+            )
+            self.prefs.shown_close_hint = True
+            save_preferences(self.prefs)
+
     def _mb_show_window(self):
         """Bring the app window to the foreground from the menu-bar item."""
         try:
-            self.deiconify()         # in case it's minimised
+            self.deiconify()         # in case it's withdrawn / minimised
             self.lift()
             self.focus_force()
             # On macOS we also need to call NSRunningApplication activate
