@@ -439,23 +439,32 @@ def _save_auth_cache(bundle: dict) -> None:
         pass
 
 
+# Module-level capture of the most recent refresh failure (for diagnostics).
+_LAST_REFRESH_ERROR: str = ""
+
+
 def _refresh_workos_token(bundle: dict) -> Optional[dict]:
     """Hit WorkOS's /user_management/authenticate to swap a refresh_token for
     a new access_token + refresh_token pair. Returns a fresh bundle on
-    success, None if the refresh_token was rejected or any network step
-    failed."""
+    success, None on failure (sets _LAST_REFRESH_ERROR with details)."""
+    global _LAST_REFRESH_ERROR
+    _LAST_REFRESH_ERROR = ""
+
     refresh_token = bundle.get("refresh_token")
     access_token = bundle.get("access_token")
     if not refresh_token or not access_token:
+        _LAST_REFRESH_ERROR = "no refresh_token or access_token in bundle"
         return None
     payload = _decode_jwt_payload(access_token)
     iss = (payload.get("iss") or "").rstrip("/")
     if not iss:
+        _LAST_REFRESH_ERROR = "could not decode JWT iss claim"
         return None
     parts = iss.split("/")
     client_id = parts[-1] if parts and parts[-1].startswith("client_") else None
     auth_host = "/".join(parts[:3]) if len(parts) >= 3 else None
     if not client_id or not auth_host:
+        _LAST_REFRESH_ERROR = f"could not parse auth_host/client_id from iss={iss!r}"
         return None
 
     body = {
@@ -484,20 +493,38 @@ def _refresh_workos_token(bundle: dict) -> Optional[dict]:
                 import zlib
                 raw = zlib.decompress(raw)
             result = json.loads(raw.decode("utf-8"))
-    except Exception:
+    except urllib.error.HTTPError as e:
+        try:
+            body_text = e.read().decode("utf-8", errors="replace")
+            try:
+                body_json = json.loads(body_text)
+                err_code = body_json.get("error", "")
+                err_desc = body_json.get("error_description", body_text[:200])
+            except Exception:
+                err_code, err_desc = "", body_text[:200]
+        except Exception:
+            err_code, err_desc = "", str(e)
+        _LAST_REFRESH_ERROR = f"HTTP {e.code} {err_code}: {err_desc}"
+        return None
+    except Exception as e:
+        _LAST_REFRESH_ERROR = f"{type(e).__name__}: {e}"
         return None
 
     new_access = result.get("access_token")
     if not new_access:
+        _LAST_REFRESH_ERROR = f"response missing access_token: keys={list(result.keys())}"
         return None
     return {
         "access_token": new_access,
         "refresh_token": result.get("refresh_token", refresh_token),
         "obtained_at": int(time.time() * 1000),
-        # expires_in: derive from the new JWT's exp claim; fall back to ~6h
         "expires_in": max(60, int(_decode_jwt_payload(new_access).get("exp", 0) - time.time())) or 21599,
         "token_type": "Bearer",
     }
+
+
+def get_last_refresh_error() -> str:
+    return _LAST_REFRESH_ERROR
 
 
 def load_access_token() -> tuple[str, str, int]:
@@ -550,14 +577,30 @@ def load_access_token() -> tuple[str, str, int]:
         if not refresh_candidates or refresh_candidates[0].get("refresh_token") != sb_bundle.get("refresh_token"):
             refresh_candidates.append(sb_bundle)
 
+    last_err = ""
     for source_bundle in refresh_candidates:
         new_bundle = _refresh_workos_token(source_bundle)
         if new_bundle:
             _save_auth_cache(new_bundle)
             remaining = _bundle_remaining_seconds(new_bundle)
             return new_bundle["access_token"], "workos_tokens (refreshed)", remaining
+        last_err = get_last_refresh_error()
 
-    raise AuthError("Granola session expired and refresh failed. Open the Granola app, click on any meeting to wake it up, and try again.")
+    # Distinguish the common "refresh token rotated/consumed" case from
+    # generic failures so the UI can show the right instructions.
+    if "already exchanged" in last_err.lower() or "invalid_grant" in last_err.lower():
+        raise AuthError(
+            "Your saved Granola refresh token is no longer valid (it's already been used). "
+            "To re-authorise:\n\n"
+            "  1. Open the Granola desktop app\n"
+            "  2. Click on any meeting (this forces Granola to validate its session)\n"
+            "  3. If Granola prompts you to sign in, do so with your Google account\n"
+            "  4. Then click Reconnect here\n\n"
+            "(After this one-time fix the app will auto-refresh tokens going forward.)"
+        )
+    if last_err:
+        raise AuthError(f"Granola session expired and refresh failed: {last_err}")
+    raise AuthError("Granola session expired. Open the Granola app and sign in, then click Reconnect.")
 
 
 # ---------- HTTP ----------

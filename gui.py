@@ -232,6 +232,9 @@ class App(ctk.CTk):
         # Auto-scan state
         self._auto_scan_after_id: str | None = None
 
+        # Most recent AuthError message (shown in the reconnect dialog).
+        self._last_auth_error: str = ""
+
         # macOS menu-bar status item (top of screen) — no-op if PyObjC missing
         self.menubar = MenuBarController(
             title_text="📓",
@@ -1851,7 +1854,7 @@ class App(ctk.CTk):
         win = ctk.CTkToplevel(self)
         self._reconn_win = win
         win.title("Granola Connection")
-        win.geometry("460x260")
+        win.geometry("520x420")
         win.configure(fg_color=BG_WINDOW)
         win.resizable(False, False)
         win.transient(self)
@@ -1865,8 +1868,11 @@ class App(ctk.CTk):
         if self.token and self.token_remaining > 0:
             mins = self.token_remaining // 60
             msg = (f"You're connected to Granola.\nSession expires in about {mins} minute{'s' if mins != 1 else ''}.\n\n"
-                   "When it expires, click Reconnect — that opens the Granola app and "
-                   "auto-detects the new session.")
+                   "When it expires, click Reconnect — the app will refresh the session "
+                   "automatically (no Granola interaction needed in most cases).")
+        elif self._last_auth_error:
+            # Surface the specific failure reason from load_access_token
+            msg = self._last_auth_error
         else:
             msg = ("Your Granola session has expired (or never started).\n\n"
                    "Click Reconnect — this opens the Granola desktop app. As soon as you sign in there, "
@@ -1874,7 +1880,7 @@ class App(ctk.CTk):
 
         ctk.CTkLabel(
             win, text=msg, font=f(13), text_color=TEXT_SECONDARY,
-            wraplength=420, justify="left",
+            wraplength=460, justify="left",
         ).pack(anchor="w", padx=22, pady=(4, 16))
 
         # Status line for the watch
@@ -1916,6 +1922,13 @@ class App(ctk.CTk):
     def _start_auth_watch(self):
         """Try a self-refresh first; if that fails open Granola.app and watch
         for it to write a new session."""
+        self._reconn_status.configure(
+            text="Refreshing your session…",
+            text_color=TEXT_SECONDARY,
+        )
+        # Force the UI to redraw before we block on the network.
+        self.update_idletasks()
+
         # Step 1 — attempt a token refresh ourselves. If Granola has a valid
         # refresh_token, this succeeds without the user having to do anything.
         try:
@@ -1931,8 +1944,16 @@ class App(ctk.CTk):
             self.after(700, self._close_reconnect_dialog)
             self.after(800, self.refresh)
             return
-        except AuthError:
-            pass
+        except AuthError as e:
+            self._last_auth_error = str(e)
+            self._log(f"Refresh attempt failed: {e}")
+            # Show the specific reason on the status line.
+            preview = str(e).split("\n", 1)[0][:200]
+            self._reconn_status.configure(
+                text=f"✗ {preview}",
+                text_color=DANGER,
+            )
+            self.update_idletasks()
 
         # Step 2 — refresh failed. Open Granola and tell the user to interact
         # with it (clicking around forces Granola to make an authenticated API
@@ -2026,6 +2047,7 @@ class App(ctk.CTk):
             except AuthError as e:
                 self._log(f"AUTH ERROR: {e}")
                 self.token = None
+                self._last_auth_error = str(e)
                 self.after(0, lambda: self._set_chip("● Session expired", CHIP_ERR_FG, CHIP_ERR_BG))
                 self.after(0, lambda: self._set_status("Authentication required — click the badge", DANGER))
                 self.after(0, self._show_reconnect_dialog)
