@@ -590,13 +590,14 @@ def load_access_token() -> tuple[str, str, int]:
     # generic failures so the UI can show the right instructions.
     if "already exchanged" in last_err.lower() or "invalid_grant" in last_err.lower():
         raise AuthError(
-            "Your saved Granola refresh token is no longer valid (it's already been used). "
-            "To re-authorise:\n\n"
-            "  1. Open the Granola desktop app\n"
-            "  2. Click on any meeting (this forces Granola to validate its session)\n"
-            "  3. If Granola prompts you to sign in, do so with your Google account\n"
-            "  4. Then click Reconnect here\n\n"
-            "(After this one-time fix the app will auto-refresh tokens going forward.)"
+            "Your saved Granola refresh token is no longer valid — it's been used. "
+            "Granola itself hasn't issued a new one yet, which usually means Granola's UI is showing cached data.\n\n"
+            "To force Granola to re-authorise:\n\n"
+            "  1. Quit Granola completely  (Cmd+Q while Granola is focused, or right-click its Dock icon → Quit)\n"
+            "  2. Re-open Granola from the Applications folder\n"
+            "  3. If prompted, sign in with your Google account\n"
+            "  4. Once you see your meetings, click Reconnect here\n\n"
+            "(After this one-time fix the app auto-refreshes forever.)"
         )
     if last_err:
         raise AuthError(f"Granola session expired and refresh failed: {last_err}")

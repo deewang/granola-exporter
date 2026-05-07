@@ -1982,9 +1982,9 @@ class App(ctk.CTk):
         if not self._auth_watch_active:
             return
         elapsed = int(time.time() - self._auth_watch_started)
-        if elapsed > 120:
+        if elapsed > 600:  # 10 minutes
             self._reconn_status.configure(
-                text="Timed out after 2 minutes. Try clicking Reconnect again.",
+                text="Stopped watching after 10 minutes. Click Reconnect again when you've quit + reopened Granola.",
                 text_color=DANGER,
             )
             self._auth_watch_active = False
@@ -2011,12 +2011,16 @@ class App(ctk.CTk):
                 self.after(800, self.refresh)
                 self._auth_watch_active = False
                 return
-            except AuthError:
-                # File changed but still no valid token — keep waiting
+            except AuthError as e:
+                # File changed but still no valid token — keep waiting + log
+                self._log(f"  supabase.json changed but refresh still fails: {str(e)[:80]}…")
                 self._initial_mtime = mtime
 
+        # Friendlier status text — tells the user what to do, not just a counter
+        mins, secs = divmod(elapsed, 60)
         self._reconn_status.configure(
-            text=f"Watching for sign-in… ({elapsed}s)",
+            text=f"Waiting for Granola to write a fresh session ({mins}m {secs}s)…\n"
+                 f"If this is taking long, quit Granola (Cmd+Q) and reopen it.",
             text_color=TEXT_SECONDARY,
         )
         self._auth_watch_after_id = self.after(1000, self._poll_supabase)
