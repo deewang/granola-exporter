@@ -53,6 +53,8 @@ python3 -m PyInstaller \
     --collect-submodules AppKit \
     --collect-submodules Foundation \
     --add-data "VERSION:." \
+    --add-data "menubar-icon.png:." \
+    --add-data "menubar-icon@2x.png:." \
     $ICON_FLAG \
     gui.py
 

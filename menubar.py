@@ -6,8 +6,11 @@ rest of the app keeps functioning.
 """
 
 import json
+import os
 import subprocess
-from typing import Callable
+import sys
+from pathlib import Path
+from typing import Callable, Optional
 
 try:
     from AppKit import (
@@ -23,6 +26,30 @@ try:
     PYOBJC_OK = True
 except ImportError:
     PYOBJC_OK = False
+
+
+def _find_menubar_icon() -> Optional[str]:
+    """Locate menubar-icon@2x.png across source-tree, PyInstaller _MEIPASS,
+    and bundle Resources directory."""
+    candidates: list[Path] = []
+    here = Path(__file__).resolve().parent
+    candidates.append(here / "menubar-icon@2x.png")
+    candidates.append(here / "menubar-icon.png")
+    if getattr(sys, "_MEIPASS", ""):
+        meipass = Path(sys._MEIPASS)
+        candidates.append(meipass / "menubar-icon@2x.png")
+        candidates.append(meipass / "menubar-icon.png")
+    if getattr(sys, "frozen", False) and sys.executable:
+        # When bundled: .../Granola Export.app/Contents/MacOS/Granola Export
+        # Look in adjacent Resources/ directory for our PNG
+        macos_dir = Path(sys.executable).parent
+        contents = macos_dir.parent
+        candidates.append(contents / "Resources" / "menubar-icon@2x.png")
+        candidates.append(contents / "Resources" / "menubar-icon.png")
+    for p in candidates:
+        if p.exists():
+            return str(p)
+    return None
 
 
 # ---------- bridge classes (only defined if PyObjC is available) ----------
@@ -95,7 +122,29 @@ class MenuBarController:
         self._status_item = bar.statusItemWithLength_(-1)  # variable length
         button = self._status_item.button()
         if button is not None:
-            button.setTitle_(title_text)
+            # Prefer a template image (auto-inverts on dark menu bars). Fall
+            # back to the title_text emoji if the PNG isn't found.
+            icon_path = _find_menubar_icon()
+            applied_image = False
+            if icon_path:
+                try:
+                    image = NSImage.alloc().initWithContentsOfFile_(icon_path)
+                    if image is not None:
+                        # Constrain rendering to ~18pt (the menu-bar standard).
+                        try:
+                            image.setSize_((18, 18))
+                        except Exception:
+                            pass
+                        image.setTemplate_(True)
+                        button.setImage_(image)
+                        # Belt-and-braces: also clear the title so we don't
+                        # show emoji + image together.
+                        button.setTitle_("")
+                        applied_image = True
+                except Exception:
+                    pass
+            if not applied_image:
+                button.setTitle_(title_text)
             try:
                 button.setToolTip_("Granola Export")
             except Exception:
