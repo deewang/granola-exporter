@@ -386,34 +386,178 @@ class AuthError(Exception):
     pass
 
 
+AUTH_CACHE_FILE = PREFS_DIR / "auth-cache.json"
+
+
+def _decode_jwt_payload(jwt: str) -> dict:
+    """Decode a JWT's payload section. No signature verification."""
+    import base64
+    parts = jwt.split(".")
+    if len(parts) < 2:
+        return {}
+    p = parts[1]
+    p += "=" * (-len(p) % 4)
+    try:
+        return json.loads(base64.urlsafe_b64decode(p))
+    except Exception:
+        return {}
+
+
+def _bundle_remaining_seconds(bundle: dict) -> int:
+    """Seconds until access_token expires. Prefers JWT exp claim; falls back
+    to obtained_at + expires_in. Returns 0 (expired) if unknown."""
+    token = bundle.get("access_token", "")
+    if token:
+        payload = _decode_jwt_payload(token)
+        exp = payload.get("exp")
+        if exp:
+            return max(0, int(exp - time.time()))
+    obtained_at = bundle.get("obtained_at", 0)
+    expires_in = bundle.get("expires_in", 0)
+    if obtained_at and expires_in:
+        obtained_s = obtained_at / 1000 if obtained_at > 10**12 else obtained_at
+        return max(0, int(obtained_s + expires_in - time.time()))
+    return 0
+
+
+def _load_auth_cache() -> Optional[dict]:
+    """Read our private cache of refreshed tokens (separate from supabase.json
+    so we don't fight Granola's writes)."""
+    if not AUTH_CACHE_FILE.exists():
+        return None
+    try:
+        return json.loads(AUTH_CACHE_FILE.read_text())
+    except Exception:
+        return None
+
+
+def _save_auth_cache(bundle: dict) -> None:
+    try:
+        AUTH_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        AUTH_CACHE_FILE.write_text(json.dumps(bundle, indent=2))
+    except Exception:
+        pass
+
+
+def _refresh_workos_token(bundle: dict) -> Optional[dict]:
+    """Hit WorkOS's /user_management/authenticate to swap a refresh_token for
+    a new access_token + refresh_token pair. Returns a fresh bundle on
+    success, None if the refresh_token was rejected or any network step
+    failed."""
+    refresh_token = bundle.get("refresh_token")
+    access_token = bundle.get("access_token")
+    if not refresh_token or not access_token:
+        return None
+    payload = _decode_jwt_payload(access_token)
+    iss = (payload.get("iss") or "").rstrip("/")
+    if not iss:
+        return None
+    parts = iss.split("/")
+    client_id = parts[-1] if parts and parts[-1].startswith("client_") else None
+    auth_host = "/".join(parts[:3]) if len(parts) >= 3 else None
+    if not client_id or not auth_host:
+        return None
+
+    body = {
+        "grant_type": "refresh_token",
+        "client_id": client_id,
+        "refresh_token": refresh_token,
+    }
+    req = urllib.request.Request(
+        f"{auth_host}/user_management/authenticate",
+        data=json.dumps(body).encode(),
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": f"Granola/{CLIENT_VERSION}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15, context=SSL_CONTEXT) as resp:
+            raw = resp.read()
+            encoding = resp.headers.get("Content-Encoding", "").lower()
+            if encoding == "gzip":
+                import gzip
+                raw = gzip.decompress(raw)
+            elif encoding == "deflate":
+                import zlib
+                raw = zlib.decompress(raw)
+            result = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+
+    new_access = result.get("access_token")
+    if not new_access:
+        return None
+    return {
+        "access_token": new_access,
+        "refresh_token": result.get("refresh_token", refresh_token),
+        "obtained_at": int(time.time() * 1000),
+        # expires_in: derive from the new JWT's exp claim; fall back to ~6h
+        "expires_in": max(60, int(_decode_jwt_payload(new_access).get("exp", 0) - time.time())) or 21599,
+        "token_type": "Bearer",
+    }
+
+
 def load_access_token() -> tuple[str, str, int]:
-    """Returns (token, source_name, seconds_remaining). Raises AuthError if none valid."""
+    """Returns (token, source_name, seconds_remaining). Raises AuthError if
+    no valid token can be obtained — even after attempting a refresh."""
     if not SUPABASE_FILE.exists():
         raise AuthError(f"{SUPABASE_FILE} not found — is Granola installed?")
-    with open(SUPABASE_FILE) as f:
-        outer = json.load(f)
 
-    candidates = []
-    if "workos_tokens" in outer:
-        candidates.append(("workos_tokens", json.loads(outer["workos_tokens"])))
-    if "cognito_tokens" in outer:
-        candidates.append(("cognito_tokens", json.loads(outer["cognito_tokens"])))
+    # Pass 1: prefer a still-fresh access_token from supabase.json (Granola
+    # is the source of truth).
+    sb_bundle: Optional[dict] = None
+    sb_name: Optional[str] = None
+    try:
+        with open(SUPABASE_FILE) as f:
+            outer = json.load(f)
+    except Exception:
+        outer = {}
 
-    for name, bundle in candidates:
-        token = bundle.get("access_token")
-        if not token:
+    for name in ("workos_tokens", "cognito_tokens"):
+        if name not in outer:
             continue
-        obtained_at = bundle.get("obtained_at", 0)
-        expires_in = bundle.get("expires_in", 0)
-        remaining = 0
-        if obtained_at and expires_in:
-            obtained_s = obtained_at / 1000 if obtained_at > 10**12 else obtained_at
-            remaining = int(obtained_s + expires_in - time.time())
-            if remaining <= 0:
-                continue
-        return token, name, remaining
+        try:
+            bundle = json.loads(outer[name])
+        except Exception:
+            continue
+        if not bundle.get("access_token"):
+            continue
+        remaining = _bundle_remaining_seconds(bundle)
+        if remaining > 60:
+            return bundle["access_token"], name, remaining
+        # Remember the first non-empty bundle for refresh attempts below
+        if sb_bundle is None:
+            sb_bundle, sb_name = bundle, name
 
-    raise AuthError("No valid access token found. Open the Granola app and sign in, then try again.")
+    # Pass 2: still-fresh access_token from our private auth-cache (left over
+    # from a recent refresh).
+    cached = _load_auth_cache()
+    if cached and cached.get("access_token"):
+        remaining = _bundle_remaining_seconds(cached)
+        if remaining > 60:
+            return cached["access_token"], "auth-cache", remaining
+
+    # Pass 3: try refreshing. Prefer the cached refresh_token (newer due to
+    # rotation) then fall back to the supabase.json one.
+    refresh_candidates: list[dict] = []
+    if cached and cached.get("refresh_token") and cached.get("access_token"):
+        refresh_candidates.append(cached)
+    if sb_bundle and sb_bundle.get("refresh_token"):
+        # Skip if we already have an identical bundle from cache
+        if not refresh_candidates or refresh_candidates[0].get("refresh_token") != sb_bundle.get("refresh_token"):
+            refresh_candidates.append(sb_bundle)
+
+    for source_bundle in refresh_candidates:
+        new_bundle = _refresh_workos_token(source_bundle)
+        if new_bundle:
+            _save_auth_cache(new_bundle)
+            remaining = _bundle_remaining_seconds(new_bundle)
+            return new_bundle["access_token"], "workos_tokens (refreshed)", remaining
+
+    raise AuthError("Granola session expired and refresh failed. Open the Granola app, click on any meeting to wake it up, and try again.")
 
 
 # ---------- HTTP ----------

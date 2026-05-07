@@ -1914,7 +1914,29 @@ class App(ctk.CTk):
             self._reconn_win.destroy()
 
     def _start_auth_watch(self):
-        """Open Granola.app and poll supabase.json for a fresh token."""
+        """Try a self-refresh first; if that fails open Granola.app and watch
+        for it to write a new session."""
+        # Step 1 — attempt a token refresh ourselves. If Granola has a valid
+        # refresh_token, this succeeds without the user having to do anything.
+        try:
+            token, source, remaining = load_access_token()
+            self.token = token
+            self.token_remaining = remaining
+            self._set_chip(f"● Connected · {remaining // 60}m", CHIP_OK_FG, CHIP_OK_BG)
+            self._reconn_status.configure(
+                text=f"✓ Reconnected via {source}. Loading meetings…",
+                text_color=ACCENT,
+            )
+            self._log(f"Reconnected via {source} (no Granola interaction needed)")
+            self.after(700, self._close_reconnect_dialog)
+            self.after(800, self.refresh)
+            return
+        except AuthError:
+            pass
+
+        # Step 2 — refresh failed. Open Granola and tell the user to interact
+        # with it (clicking around forces Granola to make an authenticated API
+        # call, which forces it to write a fresh refresh_token to supabase.json).
         import subprocess
         try:
             subprocess.Popen(["open", "-a", "Granola"])
@@ -1929,7 +1951,8 @@ class App(ctk.CTk):
         self._auth_watch_active = True
         self._auth_watch_started = time.time()
         self._reconn_status.configure(
-            text="Granola opened — sign in there. Watching for new session…",
+            text="Granola opened — click any meeting in Granola to wake the session, "
+                 "then this app will reconnect automatically.",
             text_color=TEXT_SECONDARY,
         )
         self._poll_supabase()
