@@ -11,7 +11,7 @@ import urllib.error
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 
 # ---------- preferences ----------
@@ -443,37 +443,52 @@ def _save_auth_cache(bundle: dict) -> None:
 _LAST_REFRESH_ERROR: str = ""
 
 
-def _refresh_workos_token(bundle: dict) -> Optional[dict]:
+def _refresh_workos_token(bundle: dict, log: Optional[Callable[[str], None]] = None) -> Optional[dict]:
     """Hit WorkOS's /user_management/authenticate to swap a refresh_token for
     a new access_token + refresh_token pair. Returns a fresh bundle on
-    success, None on failure (sets _LAST_REFRESH_ERROR with details)."""
+    success, None on failure (sets _LAST_REFRESH_ERROR with details).
+
+    If `log` is provided, every step is reported to it as a string."""
     global _LAST_REFRESH_ERROR
     _LAST_REFRESH_ERROR = ""
+
+    def _log(msg: str):
+        if log:
+            log(msg)
 
     refresh_token = bundle.get("refresh_token")
     access_token = bundle.get("access_token")
     if not refresh_token or not access_token:
         _LAST_REFRESH_ERROR = "no refresh_token or access_token in bundle"
+        _log(f"   ✗ {_LAST_REFRESH_ERROR}")
         return None
+    _log(f"   refresh_token (suffix): …{refresh_token[-6:]}")
+
     payload = _decode_jwt_payload(access_token)
     iss = (payload.get("iss") or "").rstrip("/")
     if not iss:
         _LAST_REFRESH_ERROR = "could not decode JWT iss claim"
+        _log(f"   ✗ {_LAST_REFRESH_ERROR}")
         return None
     parts = iss.split("/")
     client_id = parts[-1] if parts and parts[-1].startswith("client_") else None
     auth_host = "/".join(parts[:3]) if len(parts) >= 3 else None
     if not client_id or not auth_host:
         _LAST_REFRESH_ERROR = f"could not parse auth_host/client_id from iss={iss!r}"
+        _log(f"   ✗ {_LAST_REFRESH_ERROR}")
         return None
+    _log(f"   auth_host: {auth_host}")
+    _log(f"   client_id: {client_id}")
 
     body = {
         "grant_type": "refresh_token",
         "client_id": client_id,
         "refresh_token": refresh_token,
     }
+    url = f"{auth_host}/user_management/authenticate"
+    _log(f"   POST {url}")
     req = urllib.request.Request(
-        f"{auth_host}/user_management/authenticate",
+        url,
         data=json.dumps(body).encode(),
         method="POST",
         headers={
@@ -493,6 +508,7 @@ def _refresh_workos_token(bundle: dict) -> Optional[dict]:
                 import zlib
                 raw = zlib.decompress(raw)
             result = json.loads(raw.decode("utf-8"))
+            _log(f"   ✓ HTTP 200 — keys: {list(result.keys())}")
     except urllib.error.HTTPError as e:
         try:
             body_text = e.read().decode("utf-8", errors="replace")
@@ -505,20 +521,25 @@ def _refresh_workos_token(bundle: dict) -> Optional[dict]:
         except Exception:
             err_code, err_desc = "", str(e)
         _LAST_REFRESH_ERROR = f"HTTP {e.code} {err_code}: {err_desc}"
+        _log(f"   ✗ {_LAST_REFRESH_ERROR}")
         return None
     except Exception as e:
         _LAST_REFRESH_ERROR = f"{type(e).__name__}: {e}"
+        _log(f"   ✗ {_LAST_REFRESH_ERROR}")
         return None
 
     new_access = result.get("access_token")
     if not new_access:
         _LAST_REFRESH_ERROR = f"response missing access_token: keys={list(result.keys())}"
+        _log(f"   ✗ {_LAST_REFRESH_ERROR}")
         return None
+    new_remaining = max(60, int(_decode_jwt_payload(new_access).get("exp", 0) - time.time())) or 21599
+    _log(f"   new access_token good for {new_remaining // 60}min")
     return {
         "access_token": new_access,
         "refresh_token": result.get("refresh_token", refresh_token),
         "obtained_at": int(time.time() * 1000),
-        "expires_in": max(60, int(_decode_jwt_payload(new_access).get("exp", 0) - time.time())) or 21599,
+        "expires_in": new_remaining,
         "token_type": "Bearer",
     }
 
@@ -527,68 +548,130 @@ def get_last_refresh_error() -> str:
     return _LAST_REFRESH_ERROR
 
 
-def load_access_token() -> tuple[str, str, int]:
+def load_access_token(log: Optional[Callable[[str], None]] = None) -> tuple[str, str, int]:
     """Returns (token, source_name, seconds_remaining). Raises AuthError if
-    no valid token can be obtained — even after attempting a refresh."""
+    no valid token can be obtained — even after attempting a refresh.
+
+    If `log` is provided, every step is reported as a string — useful for
+    the 'Diagnose connection' button in Settings."""
+    def _log(msg: str):
+        if log:
+            log(msg)
+
+    _log("[Step 1] Checking ~/Library/Application Support/Granola/supabase.json")
     if not SUPABASE_FILE.exists():
+        _log("   ✗ file does not exist — is Granola installed?")
         raise AuthError(f"{SUPABASE_FILE} not found — is Granola installed?")
+
+    try:
+        st = SUPABASE_FILE.stat()
+        from datetime import datetime as _dt
+        mtime_str = _dt.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+        _log(f"   ✓ found ({st.st_size} bytes, last written {mtime_str})")
+    except Exception as e:
+        _log(f"   ! couldn't stat: {e}")
 
     # Pass 1: prefer a still-fresh access_token from supabase.json (Granola
     # is the source of truth).
     sb_bundle: Optional[dict] = None
     sb_name: Optional[str] = None
+    _log("[Step 2] Parsing supabase.json")
     try:
         with open(SUPABASE_FILE) as f:
             outer = json.load(f)
-    except Exception:
+        _log(f"   ✓ top-level keys: {list(outer.keys())}")
+    except Exception as e:
+        _log(f"   ✗ {type(e).__name__}: {e}")
         outer = {}
 
     for name in ("workos_tokens", "cognito_tokens"):
+        _log(f"[Step 3] Checking {name}")
         if name not in outer:
+            _log(f"   ✗ key not present in supabase.json")
             continue
         try:
             bundle = json.loads(outer[name])
-        except Exception:
+        except Exception as e:
+            _log(f"   ✗ couldn't parse inner JSON: {e}")
             continue
         if not bundle.get("access_token"):
+            _log(f"   ✗ no access_token in bundle")
             continue
         remaining = _bundle_remaining_seconds(bundle)
+        rt = bundle.get("refresh_token", "")
+        _log(f"   access_token (length {len(bundle['access_token'])}), "
+             f"refresh_token (suffix …{rt[-6:] if rt else 'none'})")
         if remaining > 60:
+            _log(f"   ✓ FRESH — expires in {remaining // 60}min, USING IT")
             return bundle["access_token"], name, remaining
+        if remaining <= 0:
+            _log(f"   ✗ expired (no time remaining)")
+        else:
+            _log(f"   ✗ near-expiry ({remaining}s left, threshold 60s)")
         # Remember the first non-empty bundle for refresh attempts below
         if sb_bundle is None:
             sb_bundle, sb_name = bundle, name
 
     # Pass 2: still-fresh access_token from our private auth-cache (left over
     # from a recent refresh).
+    _log(f"[Step 4] Checking our private cache: {AUTH_CACHE_FILE}")
     cached = _load_auth_cache()
     if cached and cached.get("access_token"):
         remaining = _bundle_remaining_seconds(cached)
+        crt = cached.get("refresh_token", "")
+        _log(f"   ✓ cache present (refresh_token suffix …{crt[-6:] if crt else 'none'})")
         if remaining > 60:
+            _log(f"   ✓ cached access_token still FRESH — expires in {remaining // 60}min, USING IT")
             return cached["access_token"], "auth-cache", remaining
+        else:
+            _log(f"   ✗ cached access_token expired ({remaining}s left)")
+    else:
+        _log("   ✗ cache absent or empty")
 
     # Pass 3: try refreshing. Prefer the cached refresh_token (newer due to
     # rotation) then fall back to the supabase.json one.
-    refresh_candidates: list[dict] = []
+    _log("[Step 5] Attempting WorkOS refresh")
+    refresh_candidates: list[tuple[str, dict]] = []
     if cached and cached.get("refresh_token") and cached.get("access_token"):
-        refresh_candidates.append(cached)
+        refresh_candidates.append(("our auth-cache", cached))
     if sb_bundle and sb_bundle.get("refresh_token"):
-        # Skip if we already have an identical bundle from cache
-        if not refresh_candidates or refresh_candidates[0].get("refresh_token") != sb_bundle.get("refresh_token"):
-            refresh_candidates.append(sb_bundle)
+        if not refresh_candidates or refresh_candidates[0][1].get("refresh_token") != sb_bundle.get("refresh_token"):
+            refresh_candidates.append((f"supabase.json {sb_name}", sb_bundle))
+
+    if not refresh_candidates:
+        _log("   ✗ no refresh_token available to try")
 
     last_err = ""
-    for source_bundle in refresh_candidates:
-        new_bundle = _refresh_workos_token(source_bundle)
+    for source_label, source_bundle in refresh_candidates:
+        _log(f"   Trying refresh from: {source_label}")
+        new_bundle = _refresh_workos_token(source_bundle, log=log)
         if new_bundle:
             _save_auth_cache(new_bundle)
+            _log(f"   ✓ Saved new bundle to {AUTH_CACHE_FILE}")
             remaining = _bundle_remaining_seconds(new_bundle)
             return new_bundle["access_token"], "workos_tokens (refreshed)", remaining
         last_err = get_last_refresh_error()
 
-    # Distinguish the common "refresh token rotated/consumed" case from
-    # generic failures so the UI can show the right instructions.
-    if "already exchanged" in last_err.lower() or "invalid_grant" in last_err.lower():
+    # WorkOS explicitly told us the session is dead — a different scenario from
+    # a merely-rotated refresh_token. Often tied to billing / forced sign-out
+    # on Granola's side, in which case nothing the user does in the local app
+    # will help until they sign back into Granola.
+    low_err = last_err.lower()
+    if "session has already ended" in low_err or "session_not_found" in low_err:
+        raise AuthError(
+            "Granola has ended your session at the server (HTTP 400: 'Session has already ended').\n\n"
+            "This is most often caused by:\n"
+            "  • A failed Granola subscription payment (account auto-downgraded)\n"
+            "  • You signed out from Granola somewhere else (web, another Mac)\n"
+            "  • Granola admin revoked the session\n\n"
+            "To fix:\n\n"
+            "  1. If you have a payment failure showing in Granola → update your card or downgrade to the free plan\n"
+            "  2. Quit the Granola desktop app completely (Cmd+Q)\n"
+            "  3. Re-open Granola and sign in fresh with Google\n"
+            "  4. Once you see your meetings load, click Reconnect here\n\n"
+            "Your already-exported transcripts on disk are unaffected by any of this."
+        )
+    if "already exchanged" in low_err or "invalid_grant" in low_err:
         raise AuthError(
             "Your saved Granola refresh token is no longer valid — it's been used. "
             "Granola itself hasn't issued a new one yet, which usually means Granola's UI is showing cached data.\n\n"
@@ -602,6 +685,26 @@ def load_access_token() -> tuple[str, str, int]:
     if last_err:
         raise AuthError(f"Granola session expired and refresh failed: {last_err}")
     raise AuthError("Granola session expired. Open the Granola app and sign in, then click Reconnect.")
+
+
+def diagnose_connection(log: Callable[[str], None]) -> None:
+    """Run the full connection flow with verbose logging. Catches AuthError
+    so the diagnose pass always reports a final outcome instead of raising."""
+    log("───────────────────────────────────────────────────────")
+    log("Diagnose: walking through the full connection flow")
+    log("───────────────────────────────────────────────────────")
+    try:
+        token, source, remaining = load_access_token(log=log)
+        log("───────────────────────────────────────────────────────")
+        log(f"✓ FINAL RESULT: connected via {source}")
+        log(f"  access_token good for {remaining // 60}min")
+        log("───────────────────────────────────────────────────────")
+    except AuthError as e:
+        log("───────────────────────────────────────────────────────")
+        log(f"✗ FINAL RESULT: failed")
+        for ln in str(e).split("\n"):
+            log(f"  {ln}")
+        log("───────────────────────────────────────────────────────")
 
 
 # ---------- HTTP ----------

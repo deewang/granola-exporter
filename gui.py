@@ -27,6 +27,7 @@ from granola_core import (
     __version__ as APP_VERSION,
     collect_existing_meta,
     fetch_transcript,
+    diagnose_connection,
     install_launch_agent,
     is_launch_agent_installed,
     load_access_token,
@@ -1430,7 +1431,7 @@ class App(ctk.CTk):
         win = ctk.CTkToplevel(self)
         self._settings_win = win
         win.title("Settings")
-        win.geometry("520x520")
+        win.geometry("520x720")
         win.configure(fg_color=BG_WINDOW)
         win.resizable(False, False)
         win.transient(self)
@@ -1556,6 +1557,29 @@ class App(ctk.CTk):
             command=lambda: self._kick_auto_scan(manual=True),
         ).pack(anchor="w", padx=18, pady=(0, 14))
 
+        # Section: Diagnostics
+        diag_sec = ctk.CTkFrame(win, fg_color=BG_PANEL, corner_radius=12,
+                                 border_width=1, border_color=BORDER)
+        diag_sec.pack(fill="x", padx=22, pady=(0, 12))
+
+        ctk.CTkLabel(
+            diag_sec, text="Diagnostics", font=f(14, "bold"), text_color=TEXT_PRIMARY,
+        ).pack(anchor="w", padx=18, pady=(14, 2))
+        ctk.CTkLabel(
+            diag_sec,
+            text="Walks through every step of the connection flow and writes the result to the log panel "
+                 "in the main window. Useful when reconnect isn't working.",
+            font=f(12), text_color=TEXT_SECONDARY,
+            wraplength=440, justify="left",
+        ).pack(anchor="w", padx=18, pady=(0, 10))
+        ctk.CTkButton(
+            diag_sec, text="🔍  Diagnose connection", font=f(12, "bold"),
+            fg_color=NEUTRAL_BTN, hover_color=NEUTRAL_BTN_HOVER,
+            text_color=NEUTRAL_BTN_TEXT, corner_radius=8,
+            height=30, width=180,
+            command=self._run_diagnose,
+        ).pack(anchor="w", padx=18, pady=(0, 14))
+
         # Footer: caveat + buttons
         ctk.CTkLabel(
             win,
@@ -1581,6 +1605,18 @@ class App(ctk.CTk):
             text_color=NEUTRAL_BTN_TEXT, corner_radius=8,
             height=34, width=90, command=self._save_settings,
         ).pack(side="right")
+
+    def _run_diagnose(self):
+        """Run the verbose connection diagnose in a worker thread + open the
+        log panel so the user sees the live output."""
+        # Make sure the main-window log panel is visible
+        if not self.log_visible:
+            self._toggle_log()
+        self._log("")
+        threading.Thread(
+            target=lambda: diagnose_connection(self._log),
+            daemon=True,
+        ).start()
 
     def _save_settings(self):
         self.prefs.auto_scan_enabled = self._settings_auto_scan_var.get()
