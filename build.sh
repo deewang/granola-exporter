@@ -24,6 +24,10 @@ if [[ "${CLEAN:-0}" == "1" ]]; then
     rm -rf build dist
 fi
 
+# --- Build the Swift recorder helper (ScreenCaptureKit + AVAudioEngine) ---
+echo "Building Swift recorder helper…"
+( cd recorder && ./build-recorder.sh )
+
 ICON_FLAG=""
 if [[ -n "${ICON:-}" ]]; then
     ICON_FLAG="--icon $ICON"
@@ -55,6 +59,10 @@ python3 -m PyInstaller \
     --add-data "VERSION:." \
     --add-data "menubar-icon.png:." \
     --add-data "menubar-icon@2x.png:." \
+    --add-data "recorder/recorder:recorder" \
+    --hidden-import capture \
+    --hidden-import transcribe \
+    --hidden-import pipeline \
     $ICON_FLAG \
     gui.py
 
@@ -67,6 +75,15 @@ plutil -replace CFBundleShortVersionString -string "$VERSION" "$PLIST"
 plutil -replace CFBundleVersion -string "$VERSION" "$PLIST"
 plutil -replace CFBundleDisplayName -string "Granola Export" "$PLIST"
 plutil -replace NSHumanReadableCopyright -string "$COPYRIGHT" "$PLIST"
+
+# Native-recording usage strings + minimum OS for ScreenCaptureKit.
+plutil -replace NSScreenCaptureUsageDescription \
+    -string "During your meetings, this app uses screen capture to record system audio so it can be transcribed locally on your Mac." \
+    "$PLIST"
+plutil -replace NSMicrophoneUsageDescription \
+    -string "Records your microphone so your side of the meeting can be transcribed locally on your Mac." \
+    "$PLIST"
+plutil -replace LSMinimumSystemVersion -string "13.0" "$PLIST"
 
 # Make the VERSION file readable inside the bundle from Python via __file__/.. lookups
 mkdir -p "dist/Granola Export.app/Contents/Resources"

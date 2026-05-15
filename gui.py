@@ -397,6 +397,20 @@ class App(ctk.CTk):
             command=self._show_settings_dialog,
         ).pack(side="right", anchor="ne", padx=(0, 10), pady=(2, 0))
 
+        # ● Record button — the new primary action.
+        self.btn_record = ctk.CTkButton(
+            header, text="●  Record", font=f(13, "bold"),
+            fg_color="#DC2626", hover_color="#B91C1C",
+            text_color="#FFFFFF", corner_radius=8,
+            height=34, width=120,
+            command=self._on_record_clicked,
+        )
+        self.btn_record.pack(side="right", anchor="ne", padx=(0, 10), pady=(0, 0))
+
+        # Recording state — tracks the active capture session.
+        self._recording_session = None
+        self._record_timer_id = None
+
     def _build_toolbar(self):
         bar = ctk.CTkFrame(self._meetings_container, fg_color=BG_PANEL, corner_radius=12,
                            border_width=1, border_color=BORDER)
@@ -1422,6 +1436,123 @@ class App(ctk.CTk):
         "Every 4 hours": 240,
         "Every 8 hours": 480,
     }
+
+    # ---------- Native recording (Phase A) ----------
+
+    def _on_record_clicked(self):
+        """Toggle: start a new recording, or stop the one in progress."""
+        if self._recording_session is None:
+            self._start_recording()
+        else:
+            self._stop_recording_and_finalize()
+
+    def _start_recording(self):
+        try:
+            import capture
+        except ImportError as e:
+            messagebox.showerror("Recorder not available",
+                                   f"Could not import capture module: {e}")
+            return
+        try:
+            session = capture.start_recording(
+                on_state_change=lambda st: self.after(0, lambda s=st: self._on_record_state(s)),
+                log=self._log,
+            )
+        except capture.RecordingError as e:
+            messagebox.showerror("Couldn't start recording", str(e))
+            return
+        except Exception as e:
+            messagebox.showerror("Couldn't start recording", f"{type(e).__name__}: {e}")
+            return
+
+        self._recording_session = session
+        self.btn_record.configure(text="■  Stop", fg_color="#1F1B16", hover_color="#3A342B")
+        self._tick_record_timer()
+        self._log(f"[gui] recording started — session {session.session_id}")
+
+    def _stop_recording_and_finalize(self):
+        try:
+            import capture, pipeline
+        except ImportError as e:
+            messagebox.showerror("Recorder not available", str(e))
+            return
+
+        session = capture.stop_recording(log=self._log)
+        if self._record_timer_id:
+            try:
+                self.after_cancel(self._record_timer_id)
+            except Exception:
+                pass
+            self._record_timer_id = None
+
+        if session is None:
+            self._recording_session = None
+            self.btn_record.configure(text="●  Record", fg_color="#DC2626", hover_color="#B91C1C")
+            return
+
+        # Reset button to neutral while we transcribe.
+        self.btn_record.configure(text="… Transcribing", state="disabled",
+                                    fg_color="#1F1B16", hover_color="#3A342B")
+        self._set_status("Transcribing recording — this may take a few minutes…")
+
+        # Finalise (transcribe + write Markdown) in a background thread.
+        def worker():
+            try:
+                if session.state == "error":
+                    raise RuntimeError(session.last_error or "recorder reported an error")
+                md_path = pipeline.finalize_recording(session,
+                                                       title=None,
+                                                       log=self._log)
+                self.after(0, lambda p=md_path: self._on_recording_finalized(p))
+            except Exception as e:
+                self._log(f"[gui] finalize failed: {type(e).__name__}: {e}")
+                self.after(0, lambda err=str(e): self._on_recording_failed(err))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _tick_record_timer(self):
+        """Update the Record button label every second with elapsed time."""
+        if self._recording_session is None:
+            return
+        elapsed = self._recording_session.elapsed
+        mins, secs = divmod(int(elapsed), 60)
+        if mins >= 60:
+            hrs, mins = divmod(mins, 60)
+            label = f"■  Stop  {hrs}:{mins:02}:{secs:02}"
+        else:
+            label = f"■  Stop  {mins}:{secs:02}"
+        self.btn_record.configure(text=label)
+        self._record_timer_id = self.after(1000, self._tick_record_timer)
+
+    def _on_record_state(self, state: str):
+        """Called from the recorder's reader thread (via after(0))."""
+        if state == "recording":
+            self._set_status("Recording — speak into your mic; system audio is being captured.",
+                              "#0F8A47")
+        elif state == "stopping":
+            self._set_status("Stopping recorder…")
+        elif state == "error":
+            self._set_status("Recorder error — check the log panel.", "#DC2626")
+
+    def _on_recording_finalized(self, md_path):
+        self._recording_session = None
+        self.btn_record.configure(text="●  Record", state="normal",
+                                    fg_color="#DC2626", hover_color="#B91C1C")
+        self._set_status(f"Done — {md_path.name}", "#0F8A47")
+        self._log(f"[gui] finalized → {md_path}")
+        notify_macos(title="Recording transcribed",
+                      message=f"Saved {md_path.name} to your transcripts folder.")
+        # Refresh the meetings list to show the new entry.
+        try:
+            self.after(100, self.refresh)
+        except Exception:
+            pass
+
+    def _on_recording_failed(self, message: str):
+        self._recording_session = None
+        self.btn_record.configure(text="●  Record", state="normal",
+                                    fg_color="#DC2626", hover_color="#B91C1C")
+        self._set_status(f"Failed: {message[:120]}", "#DC2626")
 
     def _show_settings_dialog(self):
         if hasattr(self, "_settings_win") and self._settings_win.winfo_exists():
