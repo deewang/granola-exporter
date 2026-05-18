@@ -30,6 +30,7 @@ from granola_core import (
     diagnose_connection,
     install_launch_agent,
     is_launch_agent_installed,
+    granola_sync,
     load_access_token,
     load_documents,
     load_local_docs,
@@ -46,6 +47,7 @@ from granola_core import (
     write_meeting_file,
 )
 from menubar import MenuBarController
+import keychain
 
 # ---------- design tokens (Granola-inspired warm light theme) ----------
 
@@ -428,6 +430,17 @@ class App(ctk.CTk):
             width=100, height=34, command=self.refresh,
         )
         self.btn_refresh.pack(side="left")
+
+        # Opt-in, manual one-shot pull from Granola's official public API.
+        self.btn_sync = ctk.CTkButton(
+            inner, text="⤓  Sync from Granola", font=f(13),
+            fg_color=GHOST_BTN, hover_color=GHOST_BTN_HOVER,
+            text_color=GHOST_BTN_TEXT,
+            border_color=GHOST_BTN_BORDER, border_width=1,
+            corner_radius=8, height=34, width=160,
+            command=self._sync_from_granola,
+        )
+        self.btn_sync.pack(side="left", padx=(8, 0))
 
         for label, fn in [
             ("Select new", self._select_new),
@@ -2206,6 +2219,111 @@ class App(ctk.CTk):
         self._set_busy(True)
         self._set_status("Loading meetings…")
         threading.Thread(target=self._refresh_worker, daemon=True).start()
+
+    # ---------- manual Granola sync (official public API) ----------
+
+    def _sync_from_granola(self):
+        if self.worker_busy:
+            return
+        api_key = keychain.get_granola_api_key()
+        if not api_key:
+            # No modal nagging — a one-time prompt to paste the key.
+            self._prompt_for_api_key()
+            return
+        self._set_busy(True)
+        self.btn_sync.configure(text="⤓  Syncing…", state="disabled")
+        self.progress.set(0)
+        self._set_status("Syncing from Granola…")
+        self._set_chip("● Syncing", CHIP_WARN_FG, CHIP_WARN_BG)
+        threading.Thread(target=self._sync_worker, args=(api_key,), daemon=True).start()
+
+    def _sync_worker(self, api_key: str):
+        out_root = Path(self.out_root.get())
+        try:
+            stats = granola_sync(
+                out_root, api_key,
+                log=self._log,
+                on_progress=lambda i, n: self.after(0, lambda: (
+                    self.progress.set(i / n if n else 1),
+                    self._set_status(f"Syncing {i} / {n} from Granola…"),
+                )),
+            )
+            msg = (f"Synced — {stats['new']} new "
+                   f"({stats['with_transcript']} with transcripts, "
+                   f"{stats['no_transcript']} notes-only, {stats['errors']} errors)")
+            self.after(0, lambda: self._set_status(msg, ACCENT))
+            self.after(0, lambda: notify_macos(
+                title="Granola sync complete", message=msg))
+            self.after(300, self.refresh)   # re-scan local folder to show new files
+        except AuthError as e:
+            self._log(f"[sync] {e}")
+            self.after(0, lambda m=str(e): self._set_status(m.split(chr(10))[0], DANGER))
+        except Exception as e:
+            self._log(f"[sync] failed: {type(e).__name__}: {e}")
+            self.after(0, lambda: self._set_status(f"Sync failed: {e}", DANGER))
+        finally:
+            self.after(0, lambda: self.btn_sync.configure(
+                text="⤓  Sync from Granola", state="normal"))
+            self.after(0, lambda: self.progress.set(0))
+            self.after(0, lambda: self._set_chip("● Local", CHIP_OK_FG, CHIP_OK_BG))
+            self.after(0, lambda: self._set_busy(False))
+
+    def _prompt_for_api_key(self):
+        """One-time dialog to paste + save the Granola API key to Keychain."""
+        win = ctk.CTkToplevel(self)
+        win.title("Granola API key")
+        win.geometry("560x300")
+        win.configure(fg_color=BG_WINDOW)
+        win.transient(self)
+
+        ctk.CTkLabel(win, text="Connect your Granola account",
+                      font=f(20, "bold", display=True),
+                      text_color=TEXT_PRIMARY).pack(anchor="w", padx=22, pady=(20, 8))
+        ctk.CTkLabel(
+            win,
+            text=("Paste a Granola API key. It's stored securely in your macOS "
+                  "Keychain — never written to disk in the app or committed "
+                  "anywhere. Create one at docs.granola.ai/introduction."),
+            font=f(13), text_color=TEXT_SECONDARY,
+            wraplength=500, justify="left",
+        ).pack(anchor="w", padx=22, pady=(0, 14))
+
+        entry = ctk.CTkEntry(win, font=ctk.CTkFont(family="Menlo", size=12),
+                              fg_color=BG_PANEL, text_color=TEXT_PRIMARY,
+                              border_color=BORDER, border_width=1, height=36,
+                              placeholder_text="grn_…", show="•")
+        entry.pack(fill="x", padx=22, pady=(0, 8))
+        show_var = tk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            win, text="Show key", variable=show_var, font=f(12),
+            text_color=TEXT_SECONDARY, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+            checkbox_width=18, checkbox_height=18,
+            command=lambda: entry.configure(show="" if show_var.get() else "•"),
+        ).pack(anchor="w", padx=22, pady=(0, 14))
+
+        btn_row = ctk.CTkFrame(win, fg_color="transparent")
+        btn_row.pack(side="bottom", fill="x", padx=22, pady=18)
+
+        def save_and_sync():
+            key = entry.get().strip()
+            if not key:
+                return
+            if keychain.set_granola_api_key(key):
+                self._log("[sync] API key saved to Keychain")
+                win.destroy()
+                self._sync_from_granola()
+            else:
+                self._log("[sync] failed to save key to Keychain")
+
+        ctk.CTkButton(btn_row, text="Cancel", font=f(13),
+                       fg_color=GHOST_BTN, hover_color=GHOST_BTN_HOVER,
+                       text_color=GHOST_BTN_TEXT, border_color=GHOST_BTN_BORDER,
+                       border_width=1, corner_radius=8, height=34, width=90,
+                       command=win.destroy).pack(side="right", padx=(8, 0))
+        ctk.CTkButton(btn_row, text="Save & Sync", font=f(13, "bold"),
+                       fg_color=NEUTRAL_BTN, hover_color=NEUTRAL_BTN_HOVER,
+                       text_color=NEUTRAL_BTN_TEXT, corner_radius=8, height=34,
+                       width=140, command=save_and_sync).pack(side="right")
 
     def _refresh_worker(self):
         """Local-only: reads the transcripts folder. No Granola auth, no

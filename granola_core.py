@@ -8,6 +8,7 @@ import sys
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -334,6 +335,9 @@ __version__ = _read_version()
 
 GRANOLA_DIR = Path.home() / "Library/Application Support/Granola"
 SUPABASE_FILE = GRANOLA_DIR / "supabase.json"
+# Granola relocated the auth token here (newer app versions). supabase.json
+# is legacy / often empty now; stored-accounts.json is the source of truth.
+STORED_ACCOUNTS_FILE = GRANOLA_DIR / "stored-accounts.json"
 CACHE_FILE = GRANOLA_DIR / "cache-v6.json"
 
 API_BASE = "https://api.granola.ai/v1"
@@ -742,6 +746,248 @@ def fetch_transcript(doc_id: str, token: str):
         if e.code == 404:
             return None
         raise
+
+
+# ---------- one-shot manual Granola sync (opt-in, never auto) -------------
+
+def load_stored_account_token() -> tuple[str, int]:
+    """Read the access token from Granola's current location.
+
+    Newer Granola versions store it in stored-accounts.json (the legacy
+    supabase.json is often empty now). Returns (token, seconds_remaining).
+    Raises AuthError if missing or expired — caller surfaces this as a
+    plain status message, NOT a modal.
+    """
+    if not STORED_ACCOUNTS_FILE.exists():
+        raise AuthError(
+            "stored-accounts.json not found. Open the Granola app and sign in, "
+            "then try Sync again."
+        )
+    try:
+        outer = json.loads(STORED_ACCOUNTS_FILE.read_text())
+        accounts = json.loads(outer["accounts"])
+    except Exception as e:
+        raise AuthError(f"couldn't parse stored-accounts.json: {e}")
+    if not accounts:
+        raise AuthError("no Granola accounts found — sign in to Granola first")
+    try:
+        tokens = json.loads(accounts[0]["tokens"])
+        token = tokens["access_token"]
+    except Exception as e:
+        raise AuthError(f"no access_token in stored account: {e}")
+    payload = _decode_jwt_payload(token)
+    remaining = int(payload.get("exp", 0) - time.time())
+    if remaining <= 0:
+        raise AuthError(
+            "Granola token expired. Open the Granola app (it refreshes the "
+            "token automatically), then try Sync again."
+        )
+    return token, remaining
+
+
+# Official Granola public API (https://docs.granola.ai/introduction).
+# Stable, key-authed — unlike the reverse-engineered WorkOS token path.
+GRANOLA_API_BASE = "https://public-api.granola.ai/v1"
+
+
+def _granola_api_get(path: str, api_key: str, timeout: int = 30):
+    req = urllib.request.Request(
+        f"{GRANOLA_API_BASE}{path}",
+        method="GET",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "application/json",
+            "User-Agent": "GranolaExport/1.x",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout, context=SSL_CONTEXT) as resp:
+        raw = resp.read()
+        enc = resp.headers.get("Content-Encoding", "").lower()
+        if enc == "gzip":
+            import gzip
+            raw = gzip.decompress(raw)
+        elif enc == "deflate":
+            import zlib
+            raw = zlib.decompress(raw)
+        return json.loads(raw.decode("utf-8"))
+
+
+def granola_api_list_notes(api_key: str, cursor: Optional[str] = None) -> tuple[list[dict], bool, Optional[str]]:
+    """One page of GET /notes. Returns (notes, has_more, next_cursor)."""
+    path = "/notes"
+    if cursor:
+        path += f"?cursor={urllib.parse.quote(cursor)}"
+    data = _granola_api_get(path, api_key)
+    return data.get("notes", []), bool(data.get("hasMore")), data.get("cursor")
+
+
+def granola_api_get_note(api_key: str, note_id: str) -> dict:
+    """GET /notes/{id}?include=transcript — full note + transcript array."""
+    return _granola_api_get(
+        f"/notes/{urllib.parse.quote(note_id)}?include=transcript", api_key
+    )
+
+
+def _api_note_to_doc(note: dict) -> dict:
+    """Map an official-API note into the doc dict write_meeting_file expects."""
+    attendees = note.get("attendees") or []
+    owner = note.get("owner") or {}
+    people_list = list(attendees)
+    if owner and owner not in people_list:
+        people_list = [owner] + people_list
+    return {
+        "id": note.get("id") or "",
+        "title": note.get("title") or "Untitled",
+        "created_at": note.get("created_at", ""),
+        "updated_at": note.get("updated_at", ""),
+        # extract_people() iterates dict-values that are lists of {name,email}
+        "people": {"attendees": people_list},
+        "notes_markdown": note.get("summary_markdown") or "",
+        "summary": None,
+    }
+
+
+def _api_transcript_to_segments(transcript: list) -> list[dict]:
+    """Map API transcript segments → the {source,text,start,end} shape that
+    coalesce_transcript() consumes. speaker.source 'speaker' = the other
+    party (→ Them via SPEAKER_LABELS['system']); 'microphone' = the user."""
+    segs: list[dict] = []
+    for s in transcript or []:
+        text = (s.get("text") or "").strip()
+        if not text:
+            continue
+        src_raw = ((s.get("speaker") or {}).get("source") or "").lower()
+        source = "microphone" if src_raw == "microphone" else "system"
+        segs.append({
+            "source": source,
+            "text": text,
+            "start": s.get("start_time", ""),
+            "end": s.get("end_time", ""),
+        })
+    return segs
+
+
+def _dedup_key(date_iso: str, title: str) -> str:
+    """Stable `<local-date>_<slug>` key derived ONLY from the meeting's
+    timestamp + title — never the id. Symmetric across the old
+    reverse-engineered export (8-hex ids) and the official API (not_ ids),
+    which otherwise produce different filenames for the same meeting."""
+    dt = parse_iso(date_iso)
+    ds = dt.astimezone().strftime("%Y-%m-%d_%H%M") if dt else "0000-00-00_0000"
+    return f"{ds}_{slugify(title or 'Untitled')}"
+
+
+def _local_dedup_keys(transcripts_dir: Path) -> set[str]:
+    """One (date, slug) key per existing transcript, parsed from frontmatter
+    so re-syncing never duplicates the ~400 already-exported meetings."""
+    keys: set[str] = set()
+    for m in collect_existing_meta(transcripts_dir):
+        keys.add(_dedup_key(m.date, m.title))
+    return keys
+
+
+def _doc_dedup_key(doc: dict) -> str:
+    return _dedup_key(doc.get("created_at", ""), doc.get("title") or "Untitled")
+
+
+def granola_sync(out_root: Path,
+                  api_key: str,
+                  log: Optional[Callable[[str], None]] = None,
+                  on_progress: Optional[Callable[[int, int], None]] = None) -> dict:
+    """Pull every Granola note not already present locally via the OFFICIAL
+    public API and write it as Markdown. Manual, one-shot, key-authed.
+
+    Reuses write_meeting_file / coalesce_transcript / write_index unchanged.
+    """
+    def _log(m: str):
+        if log:
+            log(m)
+
+    if not api_key:
+        raise AuthError(
+            "No Granola API key set. Add one in Settings → Granola API key "
+            "(create a key at https://docs.granola.ai/introduction)."
+        )
+
+    out_dir = out_root / "transcripts"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    existing_keys = _local_dedup_keys(out_dir)
+
+    # 1) Page through the full note list (cursor-based).
+    notes: list[dict] = []
+    cursor = None
+    try:
+        while True:
+            page, has_more, cursor = granola_api_list_notes(api_key, cursor)
+            notes.extend(page)
+            _log(f"[sync] listed {len(notes)} notes…")
+            if not has_more or not cursor:
+                break
+            time.sleep(0.25)  # well under the 5 req/s sustained limit
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            raise AuthError("Granola API key rejected (401/403). Check the key in Settings.")
+        raise
+
+    # 2) Keep only notes whose date+slug isn't already on disk.
+    candidates = []
+    for n in notes:
+        doc_stub = {"id": n.get("id", ""), "title": n.get("title") or "Untitled",
+                    "created_at": n.get("created_at", "")}
+        if n.get("id") and _doc_dedup_key(doc_stub) not in existing_keys:
+            candidates.append(n)
+    _log(f"[sync] {len(notes)} notes in Granola, {len(candidates)} new to import")
+
+    entries_by_name = {m.filename: m for m in collect_existing_meta(out_dir)}
+    fetched = errors = no_tx = 0
+    for i, note in enumerate(candidates, 1):
+        title = note.get("title") or "Untitled"
+        try:
+            full = granola_api_get_note(api_key, note["id"])
+            doc = _api_note_to_doc(full)
+            segments = _api_transcript_to_segments(full.get("transcript") or [])
+            if segments:
+                fetched += 1
+            else:
+                no_tx += 1
+            _, meta = write_meeting_file(out_dir, doc, segments or None)
+            entries_by_name[meta.filename] = meta
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                _log("[sync] rate-limited (429) — backing off 5s")
+                time.sleep(5)
+                continue
+            if e.code in (401, 403):
+                _log("[sync] API key rejected mid-sync — stopping")
+                break
+            errors += 1
+            _log(f"[sync] HTTP {e.code} for {title}")
+        except Exception as e:
+            errors += 1
+            _log(f"[sync] error on {title}: {e}")
+
+        if on_progress:
+            try:
+                on_progress(i, len(candidates))
+            except Exception:
+                pass
+        time.sleep(0.22)  # ~4.5 req/s, under the 5 req/s sustained ceiling
+
+    try:
+        write_index(out_root, list(entries_by_name.values()))
+    except Exception as e:
+        _log(f"[sync] INDEX.md error: {e}")
+
+    stats = {
+        "total": len(notes),
+        "new": len(candidates),
+        "with_transcript": fetched,
+        "no_transcript": no_tx,
+        "errors": errors,
+    }
+    _log(f"[sync] done — imported {len(candidates)} "
+         f"({fetched} with transcripts, {no_tx} notes-only, {errors} errors)")
+    return stats
 
 
 # ---------- documents ----------
