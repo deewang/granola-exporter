@@ -442,26 +442,13 @@ class App(ctk.CTk):
         )
         self.btn_sync.pack(side="left", padx=(8, 0))
 
-        for label, fn in [
-            ("Select new", self._select_new),
-            ("All", self._select_all),
-            ("Clear", self._select_none),
-        ]:
-            ctk.CTkButton(
-                inner, text=label, font=f(13),
-                fg_color=GHOST_BTN, hover_color=GHOST_BTN_HOVER,
-                text_color=GHOST_BTN_TEXT,
-                border_color=GHOST_BTN_BORDER, border_width=1,
-                corner_radius=8, height=34, width=90, command=fn,
-            ).pack(side="left", padx=(8, 0))
-
-        self.btn_export = ctk.CTkButton(
-            inner, text="Export selected  →", font=f(13, "bold"),
-            fg_color=ACCENT, hover_color=ACCENT_HOVER,
-            text_color=TEXT_ON_ACCENT, corner_radius=8,
-            width=170, height=34, command=self.export,
-        )
-        self.btn_export.pack(side="right")
+        # NOTE: the old "Select new / All / Clear / Export selected" cluster
+        # was Granola-pull-era UI — you'd tick meetings to download from
+        # Granola's cloud. In local mode the transcripts are already files on
+        # disk and Sync fetches everything missing automatically, so there's
+        # nothing to "select" or "export". Those buttons are removed; the
+        # vestigial export()/_export_worker path (which still hit Granola
+        # auth and popped the reconnect dialog) is now unreachable.
 
         ctk.CTkButton(
             inner, text="Open folder", font=f(13),
@@ -503,11 +490,9 @@ class App(ctk.CTk):
         info_link.bind("<Enter>", lambda _e: info_link.configure(text_color=TEXT_PRIMARY))
         info_link.bind("<Leave>", lambda _e: info_link.configure(text_color=TEXT_SECONDARY))
 
-        # Right: selected count
-        self.selected_label = ctk.CTkLabel(
-            top_row, text="0 selected", font=f(12, "bold"), text_color=TEXT_PRIMARY,
-        )
-        self.selected_label.pack(side="right")
+        # (Selection UI removed in local mode — keep the attribute as an
+        # off-screen no-op so legacy references stay valid.)
+        self.selected_label = ctk.CTkLabel(top_row, text="")
 
         # Sort dropdown next to selected count
         ctk.CTkLabel(
@@ -795,9 +780,9 @@ class App(ctk.CTk):
             w["var"].set(did in self.checked)
 
     def _update_count(self):
-        n = len(self.checked)
-        self.selected_label.configure(text=f"{n} selected")
-        self.btn_export.configure(state="normal" if n else "disabled")
+        # Selection UI is gone in local mode; keep the method as a harmless
+        # no-op so existing call sites don't need touching.
+        pass
 
     # ---------- sort + pagination ----------
 
@@ -925,12 +910,7 @@ class App(ctk.CTk):
 
     def _set_busy(self, busy: bool):
         self.worker_busy = busy
-        if busy:
-            self.btn_refresh.configure(state="disabled")
-            self.btn_export.configure(state="disabled")
-        else:
-            self.btn_refresh.configure(state="normal")
-            self._update_count()
+        self.btn_refresh.configure(state="disabled" if busy else "normal")
 
     # ---------- connection chip + auth flow ----------
 
@@ -2361,23 +2341,10 @@ class App(ctk.CTk):
     # ---------- export ----------
 
     def export(self):
-        # Legacy Granola "Export selected" path. In local-only mode the
-        # transcripts already live on disk, so there is nothing to export
-        # and nothing to authenticate. Kept inert for one release.
-        if self.worker_busy or not self.checked:
-            return
-
-        out_root = Path(self.out_root.get())
-        out_dir = out_root / "transcripts"
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        to_export = [d for d in self.docs if d["id"] in self.checked]
-        self._set_busy(True)
-        self.progress.set(0)
-        self._set_status(f"Exporting 0 / {len(to_export)}…")
-        threading.Thread(
-            target=self._export_worker, args=(to_export, out_root, out_dir), daemon=True
-        ).start()
+        # Fully retired. The Granola-pull "Export selected" workflow and its
+        # _export_worker (which authenticated with Granola and could pop the
+        # reconnect dialog) are gone. Use "⤓ Sync from Granola" instead.
+        return
 
     def _export_worker(self, docs: list[dict], out_root: Path, out_dir: Path):
         """Always releases worker_busy in finally so the UI never gets stuck."""
