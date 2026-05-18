@@ -1216,12 +1216,35 @@ def load_local_docs(transcripts_dir: Path) -> list[dict]:
             fm = _parse_frontmatter(p.read_text())
         except Exception:
             fm = {}
+        # Frontmatter stores participants as a bracketed list of quoted
+        # strings (names and/or emails). Reconstruct the nested `people`
+        # shape aggregate_people() expects so the People tab populates.
+        people: dict = {}
+        raw = (fm.get("participants") or "").strip()
+        if raw.startswith("[") and raw != "[]":
+            try:
+                items = json.loads(raw)
+            except Exception:
+                items = [s.strip().strip('"').strip("'")
+                         for s in raw[1:-1].split(",") if s.strip()]
+            attendees = []
+            for s in items:
+                s = str(s).strip()
+                if not s:
+                    continue
+                if "@" in s:
+                    attendees.append({"email": s,
+                                      "name": s.split("@")[0].replace(".", " ").title()})
+                else:
+                    attendees.append({"name": s})
+            if attendees:
+                people = {"attendees": attendees}
         docs.append({
             "id": fm.get("id") or p.stem,
             "title": fm.get("title") or p.stem,
             "created_at": fm.get("date", ""),
             "updated_at": fm.get("updated_at", ""),
-            "people": {},
+            "people": people,
             "notes_markdown": "",
             "has_transcript": fm.get("has_transcript", "false") == "true",
             "_local_path": str(p),
