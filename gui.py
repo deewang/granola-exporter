@@ -1504,11 +1504,87 @@ class App(ctk.CTk):
                                                        title=None,
                                                        log=self._log)
                 self.after(0, lambda p=md_path: self._on_recording_finalized(p))
+            except pipeline.WhisperCliMissing as e:
+                self._log(f"[gui] {e}")
+                self.after(0, lambda msg=str(e): self._show_whisper_missing_dialog(msg))
             except Exception as e:
                 self._log(f"[gui] finalize failed: {type(e).__name__}: {e}")
                 self.after(0, lambda err=str(e): self._on_recording_failed(err))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _show_whisper_missing_dialog(self, message: str):
+        """Recording succeeded but whisper-cli isn't installed. Audio is
+        preserved; offer a one-click Homebrew install."""
+        self._recording_session = None
+        self.btn_record.configure(text="●  Record", state="normal",
+                                    fg_color="#DC2626", hover_color="#B91C1C")
+        self._set_status("Recording saved — needs whisper.cpp to transcribe", "#F59E0B")
+
+        win = ctk.CTkToplevel(self)
+        win.title("Transcription needs whisper.cpp")
+        win.geometry("560x360")
+        win.configure(fg_color=BG_WINDOW)
+        win.transient(self)
+
+        ctk.CTkLabel(win, text="Almost there", font=f(20, "bold", display=True),
+                      text_color=TEXT_PRIMARY).pack(anchor="w", padx=22, pady=(20, 8))
+        ctk.CTkLabel(
+            win,
+            text=("Your meeting audio was captured and saved. To turn it into a "
+                  "transcript, this app needs the open-source whisper.cpp engine "
+                  "installed once.\n\nThe easiest way is Homebrew:"),
+            font=f(13), text_color=TEXT_SECONDARY, wraplength=500, justify="left",
+        ).pack(anchor="w", padx=22, pady=(0, 10))
+
+        cmd_box = ctk.CTkEntry(win, font=ctk.CTkFont(family="Menlo", size=12),
+                                fg_color=BG_PANEL, text_color=TEXT_PRIMARY,
+                                border_color=BORDER, border_width=1, height=34)
+        cmd_box.insert(0, "brew install whisper-cpp")
+        cmd_box.configure(state="readonly")
+        cmd_box.pack(fill="x", padx=22, pady=(0, 14))
+
+        ctk.CTkLabel(
+            win,
+            text=("Once installed, your saved recording will transcribe "
+                  "automatically the next time the app runs its background scan "
+                  "— or click Settings → Scan now."),
+            font=f(12), text_color=TEXT_TERTIARY, wraplength=500, justify="left",
+        ).pack(anchor="w", padx=22, pady=(0, 16))
+
+        btn_row = ctk.CTkFrame(win, fg_color="transparent")
+        btn_row.pack(side="bottom", fill="x", padx=22, pady=18)
+
+        def copy_cmd():
+            self.clipboard_clear()
+            self.clipboard_append("brew install whisper-cpp")
+            copy_btn.configure(text="✓ Copied")
+            self.after(1500, lambda: copy_btn.configure(text="Copy command"))
+
+        def run_in_terminal():
+            import subprocess
+            subprocess.run([
+                "osascript", "-e",
+                'tell application "Terminal" to do script "brew install whisper-cpp"',
+                "-e", 'tell application "Terminal" to activate',
+            ])
+            win.destroy()
+
+        ctk.CTkButton(btn_row, text="Close", font=f(13),
+                       fg_color=GHOST_BTN, hover_color=GHOST_BTN_HOVER,
+                       text_color=GHOST_BTN_TEXT, border_color=GHOST_BTN_BORDER,
+                       border_width=1, corner_radius=8, height=34, width=80,
+                       command=win.destroy).pack(side="right", padx=(8, 0))
+        copy_btn = ctk.CTkButton(btn_row, text="Copy command", font=f(13),
+                                  fg_color=GHOST_BTN, hover_color=GHOST_BTN_HOVER,
+                                  text_color=GHOST_BTN_TEXT, border_color=GHOST_BTN_BORDER,
+                                  border_width=1, corner_radius=8, height=34, width=130,
+                                  command=copy_cmd)
+        copy_btn.pack(side="right", padx=(8, 0))
+        ctk.CTkButton(btn_row, text="Run in Terminal", font=f(13, "bold"),
+                       fg_color=NEUTRAL_BTN, hover_color=NEUTRAL_BTN_HOVER,
+                       text_color=NEUTRAL_BTN_TEXT, corner_radius=8, height=34,
+                       width=150, command=run_in_terminal).pack(side="right")
 
     def _tick_record_timer(self):
         """Update the Record button label every second with elapsed time."""

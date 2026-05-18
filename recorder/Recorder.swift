@@ -76,33 +76,33 @@ final class MicRecorder {
                             "input format invalid (no mic permission?)"])
         }
 
-        // Target: 16 kHz mono PCM int16.
-        guard let targetFormat = AVAudioFormat(
-            commonFormat: .pcmFormatInt16,
-            sampleRate: targetSampleRate,
-            channels: targetChannelCount,
-            interleaved: true
-        ) else {
-            throw NSError(domain: "MicRecorder", code: 2,
-                          userInfo: [NSLocalizedDescriptionKey: "target format invalid"])
-        }
-
-        audioFile = try AVAudioFile(forWriting: outputURL, settings: wavSettings)
-        converter = AVAudioConverter(from: inputFormat, to: targetFormat)
+        // AVAudioFile stores 16-bit PCM on disk (per wavSettings) but its
+        // *processingFormat* — what write(from:) expects — is always float32.
+        // Converting to a hand-rolled int16 format and writing it traps inside
+        // ExtAudioFile, so we must convert to audioFile.processingFormat.
+        let file = try AVAudioFile(forWriting: outputURL, settings: wavSettings)
+        audioFile = file
+        let fileFormat = file.processingFormat
+        converter = AVAudioConverter(from: inputFormat, to: fileFormat)
 
         input.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buf, _ in
             guard let self = self,
                   let converter = self.converter,
                   let outFile = self.audioFile else { return }
 
-            // Calculate output capacity based on sample rate ratio.
-            let ratio = targetSampleRate / inputFormat.sampleRate
+            let ratio = fileFormat.sampleRate / inputFormat.sampleRate
             let outCapacity = AVAudioFrameCount(Double(buf.frameLength) * ratio + 1024)
-            guard let outBuf = AVAudioPCMBuffer(pcmFormat: targetFormat,
+            guard let outBuf = AVAudioPCMBuffer(pcmFormat: fileFormat,
                                                  frameCapacity: outCapacity) else { return }
 
             var error: NSError?
+            var fed = false
             let status = converter.convert(to: outBuf, error: &error) { _, statusPtr in
+                if fed {
+                    statusPtr.pointee = .noDataNow
+                    return nil
+                }
+                fed = true
                 statusPtr.pointee = .haveData
                 return buf
             }
@@ -110,6 +110,7 @@ final class MicRecorder {
                 emitError("mic convert failed: \(error?.localizedDescription ?? "unknown")")
                 return
             }
+            if outBuf.frameLength == 0 { return }
             do {
                 try outFile.write(from: outBuf)
                 self.samplesWritten += Int64(outBuf.frameLength)
@@ -176,18 +177,11 @@ final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         config.height = 2
         config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
 
-        // Set up target PCM format for writing.
-        guard let format = AVAudioFormat(
-            commonFormat: .pcmFormatInt16,
-            sampleRate: targetSampleRate,
-            channels: targetChannelCount,
-            interleaved: true
-        ) else {
-            throw NSError(domain: "SystemAudioRecorder", code: 2,
-                          userInfo: [NSLocalizedDescriptionKey: "target format invalid"])
-        }
-        targetFormat = format
-        audioFile = try AVAudioFile(forWriting: outputURL, settings: wavSettings)
+        // Same constraint as the mic path: write(from:) requires buffers in
+        // the file's processingFormat (float32), not a hand-rolled int16.
+        let file = try AVAudioFile(forWriting: outputURL, settings: wavSettings)
+        audioFile = file
+        targetFormat = file.processingFormat
 
         let s = SCStream(filter: filter, configuration: config, delegate: self)
         try s.addStreamOutput(self, type: .audio, sampleHandlerQueue: writeQueue)
@@ -259,7 +253,8 @@ final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
             dstBL[0].mDataByteSize = audioBufferList.mBuffers.mDataByteSize
         }
 
-        // Convert to our target 16 kHz mono int16 PCM.
+        // Convert to the file's processingFormat (float32). targetFormat was
+        // set to audioFile.processingFormat in start().
         guard let converter = AVAudioConverter(from: srcFormat, to: targetFormat) else { return }
         let ratio = targetFormat.sampleRate / srcFormat.sampleRate
         let outCapacity = AVAudioFrameCount(Double(frameCount) * ratio + 1024)
@@ -267,7 +262,13 @@ final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
                                               frameCapacity: outCapacity) else { return }
 
         var convErr: NSError?
+        var fed = false
         let convStatus = converter.convert(to: outBuf, error: &convErr) { _, statusPtr in
+            if fed {
+                statusPtr.pointee = .noDataNow
+                return nil
+            }
+            fed = true
             statusPtr.pointee = .haveData
             return srcBuf
         }
@@ -275,6 +276,7 @@ final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
             emitError("system audio convert failed: \(convErr?.localizedDescription ?? "unknown")")
             return
         }
+        if outBuf.frameLength == 0 { return }
 
         do {
             try audioFile?.write(from: outBuf)
@@ -352,22 +354,43 @@ signalSource.setEventHandler {
 signalSource.resume()
 signal(SIGINT, SIG_IGN)
 
-// Start everything.
+// Start everything. The two sources fail independently: as long as at least
+// one track is recording we keep going. System-audio failure (e.g. Screen
+// Recording permission not granted) degrades to mic-only instead of aborting.
 Task { @MainActor in
+    var micOK = false
+    var systemOK = false
+
     do {
         try micRecorder.start()
+        micOK = true
     } catch {
         emitError("mic start failed: \(error.localizedDescription)", code: 3)
-        exit(3)
     }
+
     do {
         try await systemRecorder.start()
+        systemOK = true
     } catch {
-        emitError("system audio start failed: \(error.localizedDescription)", code: 4)
-        exit(4)
+        let desc = error.localizedDescription
+        // Detect the TCC-declined case so the orchestrator can prompt the
+        // user to grant Screen Recording permission.
+        if desc.contains("declined") || desc.contains("TCC") {
+            emit("system_audio_permission_needed", ["detail": desc])
+        } else {
+            emitError("system audio start failed: \(desc)", code: 4)
+        }
     }
+
+    guard micOK || systemOK else {
+        emitError("both audio sources failed — nothing to record", code: 5)
+        exit(5)
+    }
+
     heartbeat.start()
     emit("recording_started", [
+        "mic": micOK,
+        "system": systemOK,
         "system_path": systemURL.path,
         "mic_path": micURL.path,
     ])

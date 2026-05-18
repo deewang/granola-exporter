@@ -30,10 +30,17 @@ from granola_core import (
     write_meeting_file,
 )
 from transcribe import (
+    TranscribeError,
     download_model,
+    find_whisper_cli,
     model_exists,
     transcribe_wav,
 )
+
+
+class WhisperCliMissing(Exception):
+    """Raised when whisper-cli isn't installed. The recording's audio is
+    preserved so it can be transcribed once whisper.cpp is available."""
 
 
 def finalize_recording(session: RecordingSession,
@@ -45,6 +52,24 @@ def finalize_recording(session: RecordingSession,
     """
     prefs = load_preferences()
     model_size = getattr(prefs, "transcription_model", None) or "small.en"
+
+    # Step 0 — bail early (and non-destructively) if whisper-cli is missing.
+    # The audio stays on disk so the user can transcribe after installing.
+    if find_whisper_cli() is None:
+        try:
+            status_path = session.out_dir / "status.json"
+            if status_path.exists():
+                data = json.loads(status_path.read_text())
+                data["status"] = "needs_whisper"
+                status_path.write_text(json.dumps(data))
+        except Exception:
+            pass
+        raise WhisperCliMissing(
+            f"whisper-cli isn't installed, so this recording couldn't be "
+            f"transcribed yet. Your audio is saved at:\n{session.out_dir}\n\n"
+            f"Install whisper.cpp, then it'll transcribe automatically next "
+            f"time the app scans for pending recordings."
+        )
 
     # Step 1 — ensure the Whisper model is downloaded.
     if not model_exists(model_size):
@@ -143,6 +168,8 @@ def find_pending_sessions() -> list[Path]:
             data = json.loads(status_path.read_text())
         except Exception:
             continue
-        if data.get("status") in ("pending", "recording"):  # 'recording' = crashed mid-session
+        # 'recording' = crashed mid-session; 'needs_whisper' = captured but
+        # whisper-cli wasn't installed at the time.
+        if data.get("status") in ("pending", "recording", "needs_whisper"):
             pending.append(entry)
     return pending
