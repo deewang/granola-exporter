@@ -1891,57 +1891,30 @@ class App(ctk.CTk):
         ).start()
 
     def _auto_scan_worker(self, manual: bool):
-        """Background tick: finalise any pending local recordings (transcribe
-        recordings that were captured but not yet turned into Markdown).
-        No Granola, no auth, no network."""
+        """Background tick (in-app timer). Delegates to the SAME
+        granola_core.background_tick() the launchd daemon uses, so behaviour
+        is identical whether the app is open or closed:
+          1. finalise pending local recordings
+          2. sync new meetings from Granola's official API (if a key is set)."""
         self.menubar.set_title("📓⟳")
         try:
-            import pipeline
-            pending = pipeline.find_pending_sessions()
-            if not pending:
-                self._log("Background scan: no pending recordings to transcribe")
-                self.prefs.last_scan_iso = datetime.now().isoformat(timespec="seconds")
-                self.prefs.last_scan_new_count = 0
-                self.prefs.last_scan_fetched_count = 0
-                save_preferences(self.prefs)
-                return
+            from granola_core import background_tick
+            self._log("Background scan starting "
+                      f"({'manual' if manual else 'scheduled'})…")
+            stats = background_tick(log=self._log)
+            total = stats["recordings"] + stats["synced"]
+            self._log(f"Background scan done — {stats['synced']} synced, "
+                      f"{stats['recordings']} recorded, {stats['errors']} errors")
 
-            self._log(f"Background scan: {len(pending)} pending recording(s) to finalise")
-            from capture import RecordingSession
-            done = 0
-            for session_dir in pending:
-                try:
-                    # Reconstruct a minimal session pointing at the dir on disk.
-                    sess = RecordingSession(
-                        session_id=session_dir.name,
-                        out_dir=session_dir,
-                        started_at=session_dir.stat().st_mtime,
-                        state="done",
-                    )
-                    md_path = pipeline.finalize_recording(sess, title=None, log=self._log)
-                    done += 1
-                    self._log(f"  finalised → {md_path.name}")
-                except pipeline.WhisperCliMissing as e:
-                    self._log(f"  still needs whisper.cpp: {session_dir.name}")
-                except Exception as e:
-                    self._log(f"  finalise error for {session_dir.name}: {e}")
-
-            self.prefs.last_scan_iso = datetime.now().isoformat(timespec="seconds")
-            self.prefs.last_scan_new_count = done
-            self.prefs.last_scan_fetched_count = done
-            save_preferences(self.prefs)
-
-            if done and self.prefs.notify_on_new:
-                phrase = "1 recording" if done == 1 else f"{done} recordings"
+            if total and self.prefs.notify_on_new:
                 self.menubar.notify(
                     title="Granola Export",
-                    message=f"Transcribed {phrase} in the background.",
+                    message=(f"{total} new meeting{'s' if total != 1 else ''} "
+                             f"added in the background."),
                     action_key="open_folder",
                 )
-
-            if done:
+            if total:
                 self.after(0, self.refresh)
-
         except Exception as e:
             self._log(f"Background scan unexpected error: {type(e).__name__}: {e}")
         finally:

@@ -210,108 +210,86 @@ def mark_auth_ok(prefs: "Preferences") -> None:
     prefs.last_scan_auth_status = "ok"
 
 
-# ---------- headless scan (called from daemon via --scan-once) ----------
+# ---------- background tick (shared by the launchd daemon + in-app timer) ----------
+
+def background_tick(log=None) -> dict:
+    """One background pass, used by BOTH the launchd daemon (--scan-once)
+    and the in-app auto-scan timer:
+
+      1. Finalise any pending local recordings (transcribe captures that
+         were recorded but not yet turned into Markdown).
+      2. Pull new meetings from Granola's OFFICIAL public API, if an API
+         key is stored in the Keychain.
+
+    No reverse-engineered auth, no nagging — if there's no API key it just
+    skips the cloud sync. Returns {'recordings', 'synced', 'errors'}.
+    """
+    def _log(m: str):
+        if log:
+            log(m)
+
+    prefs = load_preferences()
+    out_root = Path(prefs.output_folder) if prefs.output_folder else DEFAULT_OUT_ROOT
+    stats = {"recordings": 0, "synced": 0, "errors": 0}
+
+    # 1) Finalise pending local recordings.
+    try:
+        import pipeline
+        from capture import RecordingSession
+        for sd in pipeline.find_pending_sessions():
+            try:
+                sess = RecordingSession(
+                    session_id=sd.name, out_dir=sd,
+                    started_at=sd.stat().st_mtime, state="done",
+                )
+                pipeline.finalize_recording(sess, title=None, log=log)
+                stats["recordings"] += 1
+                _log(f"[tick] finalised recording {sd.name}")
+            except Exception as e:
+                stats["errors"] += 1
+                _log(f"[tick] finalise error {sd.name}: {e}")
+    except Exception as e:
+        _log(f"[tick] pending-recordings step failed: {e}")
+
+    # 2) Sync from Granola's official API (only if a key is configured).
+    try:
+        import keychain
+        key = keychain.get_granola_api_key()
+        if key:
+            s = granola_sync(out_root, key, log=log)
+            stats["synced"] = s.get("new", 0)
+            stats["errors"] += s.get("errors", 0)
+        else:
+            _log("[tick] no Granola API key set — skipping cloud sync")
+    except AuthError as e:
+        _log(f"[tick] cloud sync skipped: {e}")
+    except Exception as e:
+        _log(f"[tick] cloud sync error: {e}")
+
+    prefs.last_scan_iso = datetime.now().isoformat(timespec="seconds")
+    prefs.last_scan_new_count = stats["recordings"] + stats["synced"]
+    prefs.last_scan_fetched_count = stats["synced"]
+    save_preferences(prefs)
+    return stats
+
 
 def run_scan_once() -> int:
-    """Run a single scan + export pass, no UI, no event loop.
-
-    Returns the number of newly-exported meetings (0 if nothing new, -1 on
-    auth/cache failure). Sends a macOS notification for any new meetings.
-    """
+    """Entry point for the launchd daemon (`<app> --scan-once`). Runs one
+    background_tick() and notifies if anything new arrived. Returns the
+    number of new meetings (0 if none / disabled)."""
     prefs = load_preferences()
     if not prefs.auto_scan_enabled:
-        # User disabled scanning entirely — daemon should be a no-op.
         return 0
-
-    out_root = Path(prefs.output_folder) if prefs.output_folder else DEFAULT_OUT_ROOT
-    out_dir = out_root / "transcripts"
-    try:
-        out_dir.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        return -1
-
-    # 1) Auth — fire a one-shot notification on first failure
-    try:
-        token, _, _ = load_access_token()
-        mark_auth_ok(prefs)
-    except AuthError:
-        maybe_notify_auth_expired(prefs)
-        save_preferences(prefs)
-        return -1
-
-    # 2) Cache
-    try:
-        docs = load_documents()
-    except Exception:
-        save_preferences(prefs)
-        return -1
-
-    existing = scan_existing(out_dir)
-    new_docs = [d for d in docs if meeting_filename(d) not in existing]
-
-    # Persist last-scan timestamp regardless of result
-    prefs.last_scan_iso = datetime.now().isoformat(timespec="seconds")
-
-    if not new_docs:
-        prefs.last_scan_new_count = 0
-        prefs.last_scan_fetched_count = 0
-        save_preferences(prefs)
-        return 0
-
-    # 3) Fetch + write
-    entries_by_name = {m.filename: m for m in collect_existing_meta(out_dir)}
-    fetched = errors = 0
-    for doc in new_docs:
-        segments = None
-        try:
-            resp = fetch_transcript(doc["id"], token)
-            if isinstance(resp, list):
-                segments = resp
-                if segments:
-                    fetched += 1
-            elif isinstance(resp, dict):
-                for k in ("transcript", "segments", "data"):
-                    if isinstance(resp.get(k), list):
-                        segments = resp[k]
-                        if segments:
-                            fetched += 1
-                        break
-        except urllib.error.HTTPError as e:
-            if e.code in (401, 403):
-                # Token expired mid-scan — fire transition notification + bail
-                maybe_notify_auth_expired(prefs)
-                save_preferences(prefs)
-                return -1
-            errors += 1
-            continue
-        except Exception:
-            errors += 1
-            continue
-        try:
-            _, meta = write_meeting_file(out_dir, doc, segments)
-            entries_by_name[meta.filename] = meta
-        except Exception:
-            errors += 1
-
-    try:
-        write_index(out_root, list(entries_by_name.values()))
-    except Exception:
-        pass
-
-    prefs.last_scan_new_count = len(new_docs)
-    prefs.last_scan_fetched_count = fetched
-    save_preferences(prefs)
-
-    if prefs.notify_on_new:
-        n = len(new_docs)
-        phrase = "a new meeting has" if n == 1 else f"{n} new meetings have"
+    stats = background_tick()
+    total = stats["recordings"] + stats["synced"]
+    if total and prefs.notify_on_new:
         notify_macos(
             title="Granola Export",
-            message=f"Hey, {phrase} been detected, and the transcription has been exported to your computer.",
-            subtitle=f"{fetched} with transcripts" if fetched else "Notes only",
+            message=f"{total} new meeting{'s' if total != 1 else ''} added in the background.",
+            subtitle=(f"{stats['synced']} synced, {stats['recordings']} recorded"
+                      if stats["recordings"] else None) or "",
         )
-    return len(new_docs)
-
+    return total
 
 def _read_version() -> str:
     """Single source of truth for the app version, read from VERSION file.
