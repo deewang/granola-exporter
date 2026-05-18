@@ -32,6 +32,7 @@ from granola_core import (
     is_launch_agent_installed,
     load_access_token,
     load_documents,
+    load_local_docs,
     load_preferences,
     mark_auth_ok,
     maybe_notify_auth_expired,
@@ -268,7 +269,6 @@ class App(ctk.CTk):
         self.bind_all("<Command-q>", lambda _e: self._mb_quit())
 
         self.after(100, self._drain_log)
-        self.after(100, self._tick_token_status)
         self.after(200, self.refresh)
         # Arm auto-scan if user enabled it last session
         self.after(500, self._reschedule_auto_scan)
@@ -380,13 +380,15 @@ class App(ctk.CTk):
 
         # Right: connection chip + settings button
         self.conn_chip = ctk.CTkLabel(
-            header, text="● Connecting…",
+            header, text="● Local",
             font=f(12, "bold"),
-            text_color=CHIP_WARN_FG, fg_color=CHIP_WARN_BG,
+            text_color=CHIP_OK_FG, fg_color=CHIP_OK_BG,
             corner_radius=14, padx=12, pady=6,
         )
         self.conn_chip.pack(side="right", anchor="ne", pady=(2, 0))
-        self.conn_chip.bind("<Button-1>", lambda _e: self._on_chip_click())
+        # No click binding — the chip is a passive status indicator now
+        # (Local / Recording… / Transcribing…). The Granola reconnect flow
+        # is gone; the app no longer authenticates with Granola.
 
         ctk.CTkButton(
             header, text="⚙  Settings", font=f(12),
@@ -1896,133 +1898,61 @@ class App(ctk.CTk):
         ).start()
 
     def _auto_scan_worker(self, manual: bool):
-        # Notify "scan started"
-        if self.prefs.notify_on_new:
-            self.menubar.notify(
-                title="Granola Export",
-                message="Checking Granola for new meetings…",
-            )
-        self.menubar.set_title("📓⟳")  # spinning hint while scanning
-
+        """Background tick: finalise any pending local recordings (transcribe
+        recordings that were captured but not yet turned into Markdown).
+        No Granola, no auth, no network."""
+        self.menubar.set_title("📓⟳")
         try:
-            # 1) Get fresh token
-            try:
-                token, source, remaining = load_access_token()
-                self.token = token
-                self.token_remaining = remaining
-                mark_auth_ok(self.prefs)
-                save_preferences(self.prefs)
-            except AuthError:
-                self._log("Auto-scan: skipping — no valid Granola session")
-                fired = maybe_notify_auth_expired(self.prefs)
-                save_preferences(self.prefs)
-                if fired:
-                    self._log("  → notification sent (session expired)")
-                return
-
-            # 2) Reload meeting list
-            try:
-                docs = load_documents()
-            except Exception as e:
-                self._log(f"Auto-scan: cache load failed: {e}")
-                return
-
-            out_dir = Path(self.out_root.get()) / "transcripts"
-            out_dir.mkdir(parents=True, exist_ok=True)
-            existing = scan_existing(out_dir)
-            new_docs = [d for d in docs if meeting_filename(d) not in existing]
-
-            if not new_docs:
-                self._log(f"Auto-scan: no new meetings ({len(docs)} total in Granola)")
+            import pipeline
+            pending = pipeline.find_pending_sessions()
+            if not pending:
+                self._log("Background scan: no pending recordings to transcribe")
                 self.prefs.last_scan_iso = datetime.now().isoformat(timespec="seconds")
                 self.prefs.last_scan_new_count = 0
                 self.prefs.last_scan_fetched_count = 0
                 save_preferences(self.prefs)
-                # Notify "scan complete (no new)"
-                if self.prefs.notify_on_new:
-                    self.menubar.notify(
-                        title="Granola Export",
-                        message="Scan complete — no new meetings.",
-                    )
                 return
 
-            # 3) Fetch + write each new meeting
-            self._log(f"Auto-scan: found {len(new_docs)} new meetings, exporting…")
-            entries_by_name = {m.filename: m for m in collect_existing_meta(out_dir)}
-            fetched = errors = 0
-            for doc in new_docs:
-                title = doc.get("title") or "Untitled"
-                segments = None
+            self._log(f"Background scan: {len(pending)} pending recording(s) to finalise")
+            from capture import RecordingSession
+            done = 0
+            for session_dir in pending:
                 try:
-                    resp = fetch_transcript(doc["id"], self.token)
-                    if isinstance(resp, list):
-                        segments = resp
-                        if segments:
-                            fetched += 1
-                    elif isinstance(resp, dict):
-                        for k in ("transcript", "segments", "data"):
-                            if isinstance(resp.get(k), list):
-                                segments = resp[k]
-                                if segments:
-                                    fetched += 1
-                                break
-                except urllib.error.HTTPError as e:
-                    if e.code in (401, 403):
-                        self._log("Auto-scan: token expired mid-scan — stopping")
-                        fired = maybe_notify_auth_expired(self.prefs)
-                        save_preferences(self.prefs)
-                        if fired:
-                            self._log("  → notification sent (session expired)")
-                        return
-                    errors += 1
-                    self._log(f"  Auto-scan HTTP {e.code} for {title}")
-                    continue
+                    # Reconstruct a minimal session pointing at the dir on disk.
+                    sess = RecordingSession(
+                        session_id=session_dir.name,
+                        out_dir=session_dir,
+                        started_at=session_dir.stat().st_mtime,
+                        state="done",
+                    )
+                    md_path = pipeline.finalize_recording(sess, title=None, log=self._log)
+                    done += 1
+                    self._log(f"  finalised → {md_path.name}")
+                except pipeline.WhisperCliMissing as e:
+                    self._log(f"  still needs whisper.cpp: {session_dir.name}")
                 except Exception as e:
-                    errors += 1
-                    self._log(f"  Auto-scan error: {e}")
-                    continue
+                    self._log(f"  finalise error for {session_dir.name}: {e}")
 
-                try:
-                    _, meta = write_meeting_file(out_dir, doc, segments)
-                    entries_by_name[meta.filename] = meta
-                except Exception as e:
-                    errors += 1
-                    self._log(f"  Auto-scan write error: {e}")
-
-            try:
-                write_index(Path(self.out_root.get()), list(entries_by_name.values()))
-            except Exception as e:
-                self._log(f"Auto-scan index error: {e}")
-
-            self._log(
-                f"Auto-scan complete · {len(new_docs)} new · {fetched} with transcripts · {errors} errors"
-            )
-
-            # 4) Persist scan stats
             self.prefs.last_scan_iso = datetime.now().isoformat(timespec="seconds")
-            self.prefs.last_scan_new_count = len(new_docs)
-            self.prefs.last_scan_fetched_count = fetched
+            self.prefs.last_scan_new_count = done
+            self.prefs.last_scan_fetched_count = done
             save_preferences(self.prefs)
 
-            # 5) Notify "new meetings detected" — clickable, opens folder
-            if self.prefs.notify_on_new:
-                singular = len(new_docs) == 1
-                phrase = "a new meeting has" if singular else f"{len(new_docs)} new meetings have"
+            if done and self.prefs.notify_on_new:
+                phrase = "1 recording" if done == 1 else f"{done} recordings"
                 self.menubar.notify(
                     title="Granola Export",
-                    message=f"Hey, {phrase} been detected, and the transcription has been exported to your computer.",
-                    subtitle=f"{fetched} with transcripts" if fetched else "Notes only",
+                    message=f"Transcribed {phrase} in the background.",
                     action_key="open_folder",
                 )
 
-            # Refresh the visible list so new pills flip + counts update
-            self.after(0, self.refresh)
+            if done:
+                self.after(0, self.refresh)
 
         except Exception as e:
-            self._log(f"Auto-scan unexpected error: {type(e).__name__}: {e}")
+            self._log(f"Background scan unexpected error: {type(e).__name__}: {e}")
         finally:
-            self.menubar.set_title("📓")  # restore idle icon
-            # Schedule the next interval (whether this was manual or timed)
+            self.menubar.set_title("📓")
             self.after(0, self._reschedule_auto_scan)
 
     def _show_data_info(self):
@@ -2278,67 +2208,45 @@ class App(ctk.CTk):
         threading.Thread(target=self._refresh_worker, daemon=True).start()
 
     def _refresh_worker(self):
-        """Always releases worker_busy in finally so the UI can never get stuck."""
+        """Local-only: reads the transcripts folder. No Granola auth, no
+        network. Always releases worker_busy in finally."""
         try:
-            try:
-                token, source, remaining = load_access_token()
-                self.token = token
-                self.token_remaining = remaining
-                self._log(f"Authenticated via {source} (~{remaining // 60}min remaining)")
-                self.after(0, lambda r=remaining: self._set_chip(
-                    f"● Connected · {r // 60}m", CHIP_OK_FG, CHIP_OK_BG,
-                ))
-                # Reset auth-expired throttle so next failure can fire a fresh notification
-                mark_auth_ok(self.prefs)
-                save_preferences(self.prefs)
-            except AuthError as e:
-                self._log(f"AUTH ERROR: {e}")
-                self.token = None
-                self._last_auth_error = str(e)
-                self.after(0, lambda: self._set_chip("● Session expired", CHIP_ERR_FG, CHIP_ERR_BG))
-                self.after(0, lambda: self._set_status("Authentication required — click the badge", DANGER))
-                self.after(0, self._show_reconnect_dialog)
-                return
-
-            try:
-                docs = load_documents()
-            except Exception as e:
-                self._log(f"ERROR loading cache: {e}")
-                return
-
             out_dir = Path(self.out_root.get()) / "transcripts"
-            existing = scan_existing(out_dir)
+            try:
+                docs = load_local_docs(out_dir)
+            except Exception as e:
+                self._log(f"ERROR scanning local transcripts: {e}")
+                docs = []
 
             self.docs = docs
-            self.existing = existing
+            self.existing = set()       # legacy 'exported vs not' — unused locally
+            self.checked = set()
             self._apply_sort()
-            new_count = sum(1 for d in docs if meeting_filename(d) not in existing)
-
-            self.checked = {d["id"] for d in docs if meeting_filename(d) not in existing}
             self.current_page = 0
 
             self.after(0, self._render_current_page)
-            self.after(0, lambda nc=new_count: self.summary_label.configure(
-                text=f"{len(docs)} meetings · {nc} new · {len(docs) - nc} exported"
+            self.after(0, lambda n=len(docs): self.summary_label.configure(
+                text=f"{n} meeting{'s' if n != 1 else ''} in your local library"
             ))
-            self.after(0, lambda nc=new_count: self._set_status(
-                f"{nc} new meeting{'s' if nc != 1 else ''} ready to export" if nc else "All caught up",
-                ACCENT if nc else TEXT_PRIMARY,
+            self.after(0, lambda n=len(docs): self._set_status(
+                f"{n} local transcript{'s' if n != 1 else ''}" if n else
+                "No transcripts yet — click ● Record to capture a meeting",
+                TEXT_PRIMARY,
             ))
+            self.after(0, lambda: self._set_chip("● Local", CHIP_OK_FG, CHIP_OK_BG))
             self.after(0, self._update_count)
         except Exception as e:
             self._log(f"REFRESH WORKER unexpected error: {type(e).__name__}: {e}")
         finally:
-            # Guarantees the UI is unlocked, even if anything above raised.
             self.after(0, lambda: self._set_busy(False))
 
     # ---------- export ----------
 
     def export(self):
+        # Legacy Granola "Export selected" path. In local-only mode the
+        # transcripts already live on disk, so there is nothing to export
+        # and nothing to authenticate. Kept inert for one release.
         if self.worker_busy or not self.checked:
-            return
-        if not self.token:
-            self._show_reconnect_dialog()
             return
 
         out_root = Path(self.out_root.get())
@@ -2597,7 +2505,12 @@ class MeetingDetailWindow(ctk.CTkToplevel):
         return names
 
     def _existing_path(self) -> Path | None:
-        """Path to the already-exported .md file, if it exists."""
+        """Path to the .md file. Local docs carry `_local_path` directly;
+        otherwise fall back to reconstructing it from the doc fields."""
+        local = self.doc.get("_local_path")
+        if local:
+            p = Path(local)
+            return p if p.exists() else None
         out_dir = Path(self.app.out_root.get()) / "transcripts"
         path = out_dir / meeting_filename(self.doc)
         return path if path.exists() else None

@@ -919,6 +919,19 @@ def scan_existing(transcripts_dir: Path) -> set[str]:
     return {p.name for p in transcripts_dir.glob("*.md")}
 
 
+def _parse_frontmatter(text: str) -> dict:
+    """Parse the leading YAML-ish frontmatter block of a transcript .md."""
+    fm: dict = {}
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end > 0:
+            for line in text[3:end].splitlines():
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    fm[k.strip()] = v.strip().strip('"')
+    return fm
+
+
 def collect_existing_meta(transcripts_dir: Path) -> list[MeetingMeta]:
     """Best-effort parse of existing files for index regeneration."""
     out: list[MeetingMeta] = []
@@ -926,15 +939,7 @@ def collect_existing_meta(transcripts_dir: Path) -> list[MeetingMeta]:
         return out
     for p in transcripts_dir.glob("*.md"):
         try:
-            text = p.read_text()
-            fm = {}
-            if text.startswith("---"):
-                end = text.find("\n---", 3)
-                if end > 0:
-                    for line in text[3:end].splitlines():
-                        if ":" in line:
-                            k, v = line.split(":", 1)
-                            fm[k.strip()] = v.strip().strip('"')
+            fm = _parse_frontmatter(p.read_text())
             out.append(MeetingMeta(
                 filename=p.name,
                 title=fm.get("title", p.stem),
@@ -946,3 +951,35 @@ def collect_existing_meta(transcripts_dir: Path) -> list[MeetingMeta]:
         except Exception:
             pass
     return out
+
+
+def load_local_docs(transcripts_dir: Path) -> list[dict]:
+    """Build Granola-doc-shaped dicts from the local transcripts folder.
+
+    This is the Granola-free replacement for load_documents(): no auth, no
+    network, no cache — just the user's own exported/recorded .md files.
+    The returned dicts carry the keys the GUI's row renderer + detail
+    window already expect, plus `_local_path` so the detail view can read
+    the file directly instead of reconstructing a path.
+    """
+    docs: list[dict] = []
+    if not transcripts_dir.exists():
+        return docs
+    for p in sorted(transcripts_dir.glob("*.md")):
+        try:
+            fm = _parse_frontmatter(p.read_text())
+        except Exception:
+            fm = {}
+        docs.append({
+            "id": fm.get("id") or p.stem,
+            "title": fm.get("title") or p.stem,
+            "created_at": fm.get("date", ""),
+            "updated_at": fm.get("updated_at", ""),
+            "people": {},
+            "notes_markdown": "",
+            "has_transcript": fm.get("has_transcript", "false") == "true",
+            "_local_path": str(p),
+            "_filename": p.name,
+        })
+    docs.sort(key=lambda d: d.get("created_at") or "", reverse=True)
+    return docs
